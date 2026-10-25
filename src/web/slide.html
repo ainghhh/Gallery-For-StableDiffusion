@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>幻灯片 · Gallery</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:#0b0c0e; --fg:#e8eaed; --dim:#9aa0a6; --line:rgba(255,255,255,.10);
+    --accent:#3b6ef5; --panel:rgba(20,22,26,.88);
+  }
+  html, body { height:100%; overflow:hidden; background:var(--bg); color:var(--fg);
+    font-family:"Microsoft YaHei UI","Segoe UI",sans-serif; }
+
+  /* ---------- 舞台 ---------- */
+  #stage { position:fixed; inset:0; overflow:hidden; cursor:default; }
+  #stage.hideui { cursor:none; }
+
+  /* 两张叠放的图层做转场：A 是当前，B 是下一张 */
+  .layer {
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    will-change: transform, opacity; backface-visibility:hidden;
+    transform: translate3d(0,0,0);
+  }
+  /* 图片：按比例缩放，最长边抵住屏幕，另一边留黑。
+     width/height 用 100% + object-fit:contain —— 关键是要有确定的盒子尺寸，
+     小图（比如 512×512）才会被**放大**到抵住屏幕，
+     否则它按原始像素显示，只有屏幕中间一小块。 */
+  .layer img, .layer video {
+    width:100%; height:100%;
+    object-fit:contain;                 /* 等比缩放，不裁切不拉伸 */
+    image-rendering:auto;               /* 放大时平滑插值，别用像素化 */
+    display:block;
+    user-select:none; -webkit-user-drag:none;
+  }
+
+  /* ---------- 顶栏：圆角浮块 ---------- */
+  #top {
+    position:fixed; top:18px; left:50%; transform:translateX(-50%);
+    z-index:30; display:flex; align-items:center; gap:10px;
+    padding:9px 12px;
+    background:rgba(14,16,20,.90);
+    border:1px solid rgba(255,255,255,.13);
+    border-radius:15px;
+    box-shadow:0 10px 34px rgba(0,0,0,.52);
+    backdrop-filter:blur(18px) saturate(1.25);
+    -webkit-backdrop-filter:blur(18px) saturate(1.25);
+    transition: opacity .28s ease, transform .28s ease;
+  }
+
+  .sel {
+    -webkit-appearance:none; appearance:none;
+    background:var(--panel); color:var(--fg); border:1px solid var(--line);
+    border-radius:9px; padding:7px 30px 7px 12px; font-size:13px; font-family:inherit;
+    cursor:pointer; outline:none;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M0 0l5 6 5-6z' fill='%239aa0a6'/></svg>");
+    background-repeat:no-repeat; background-position:right 10px center;
+  }
+  .sel:hover { border-color: rgba(255,255,255,.24); }
+  .spacer { flex:1; }
+  .counter { font-size:13px; color:var(--dim); font-variant-numeric:tabular-nums;
+             background:var(--panel); border:1px solid var(--line);
+             border-radius:9px; padding:6px 12px; }
+  .iconbtn {
+    background:var(--panel); border:1px solid var(--line); color:var(--fg);
+    width:34px; height:34px; border-radius:9px; cursor:pointer; font-size:15px;
+    display:flex; align-items:center; justify-content:center; transition:background .15s;
+  }
+  .iconbtn:hover { background:rgba(255,255,255,.12); }
+
+  /* ---------- 播放栏：圆角浮块（不再是贴底渐变条） ---------- */
+  #bar {
+    position:fixed; left:50%; bottom:14px; transform:translateX(-50%);
+    z-index:30; max-width:min(1600px, calc(100vw - 28px));
+    /* 紧凑：一行装下所有控件 */
+    display:flex; align-items:center; gap:10px;
+    padding:7px 12px;
+    background:rgba(14,16,20,.92);
+    border:1px solid rgba(255,255,255,.13);
+    border-radius:12px;
+    box-shadow:0 10px 32px rgba(0,0,0,.6), 0 2px 6px rgba(0,0,0,.4);
+    backdrop-filter:blur(18px) saturate(1.25);
+    -webkit-backdrop-filter:blur(18px) saturate(1.25);
+    transition: opacity .24s ease, transform .24s ease;
+    white-space:nowrap;
+  }
+  /* ⚠️ 这里原来写的是 `#stage.hideui #bar` —— 但 #bar 和 #stage 是**兄弟节点**，
+     不是父子，那条选择器永远匹配不上，所以"自动隐藏"从来没生效过。
+     改成同时挂在 body 上（见 slide.js 的 setHideUI），用兄弟/后代表达式都行。 */
+  body.hideui #top {
+    opacity:0; pointer-events:none;
+    transform:translateX(-50%) translateY(-10px);
+  }
+  body.hideui #bar {
+    opacity:0; pointer-events:none;
+    transform:translateX(-50%) translateY(14px);
+  }
+  #stage.hideui { cursor:none; }
+
+  .row { display:flex; align-items:center; gap:10px; }
+  .row + .row { margin-top:0; }
+  .row.wrap { flex-wrap:nowrap; }
+  .nowrap { white-space:nowrap; }
+  .transgroup { display:flex; align-items:center; gap:7px; }
+
+  /* 竖分隔条：把播放 / 模式 / 转场 / 专属 分成 4 组，视觉不糊成一团 */
+  .sep {
+    width:1px; height:16px; background:rgba(255,255,255,.14);
+    flex:0 0 auto; margin:0 1px;
+  }
+  /* 紧凑下拉 */
+  select.sel {
+    background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--fg);
+    border-radius:6px; padding:3px 6px; font-size:11.5px; font-family:inherit;
+    outline:none; cursor:pointer; max-width:104px;
+  }
+  select.sel:focus { border-color:var(--accent); }
+
+  /* 中间：上一张 / 播放 / 下一张 */
+  .center { justify-content:center; gap:16px; }
+  .big {
+    width:32px; height:32px; border-radius:50%; font-size:13px;
+    background:var(--accent); border:none; color:#fff;
+    display:flex; align-items:center; justify-content:center; cursor:pointer;
+    transition: transform .12s ease, background .15s;
+  }
+  .big:hover { background:#4a7bf7; transform:scale(1.08); }
+  .big:active { transform:scale(.94); }
+  .step {
+    width:26px; height:26px; border-radius:50%;
+    background:rgba(255,255,255,.10); border:1px solid var(--line); color:var(--fg);
+    display:flex; align-items:center; justify-content:center; cursor:pointer;
+    font-size:10px; line-height:1; flex:0 0 auto;
+  }
+  .step:hover { background:rgba(255,255,255,.18); }
+
+  /* 速度设置 */
+  .speedgroup { display:flex; align-items:center; gap:7px; }
+  .seg { display:flex; background:rgba(255,255,255,.07); border-radius:6px; padding:2px; }
+  .seg button {
+    background:none; border:none; color:var(--dim); font-size:11.5px; font-family:inherit;
+    padding:3px 8px; border-radius:5px; cursor:pointer; white-space:nowrap;
+    transition: background .12s, color .12s;
+  }
+  .seg button:hover { color:var(--fg); }
+  .seg button.on { background:var(--accent); color:#fff; font-weight:600; }
+
+  input[type=number] {
+    width:50px; background:rgba(255,255,255,.07); border:1px solid var(--line);
+    color:var(--fg); border-radius:6px; padding:3px 6px; font-size:12px;
+    font-family:inherit; text-align:center; outline:none;
+  }
+  input[type=number]:focus { border-color:var(--accent); }
+  input[type=range] {
+    -webkit-appearance:none; appearance:none; width:104px; height:4px; border-radius:2px;
+    background:rgba(255,255,255,.16); outline:none; cursor:pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; width:12px; height:12px; border-radius:50%;
+    background:var(--accent); cursor:pointer; border:2px solid #fff;
+  }
+  .unit { font-size:11.5px; color:var(--dim); }
+
+  /* 自适应专属 */
+  #adaptive { display:none; align-items:center; gap:8px; }
+  #adaptive.on { display:flex; }
+  .rhythm {
+    display:flex; align-items:center; gap:5px; font-size:12px; color:var(--dim);
+    font-variant-numeric:tabular-nums;
+  }
+  .beat {
+    width:6px; height:15px; border-radius:2px; background:rgba(255,255,255,.14);
+    transition: background .1s, box-shadow .1s, transform .1s;
+  }
+  .beat.hit { background:var(--accent); box-shadow:0 0 8px var(--accent); transform:scaleY(1.35); }
+  .beat.past { background:rgba(59,110,245,.45); }
+  .hint { font-size:11.5px; color:var(--dim); }
+  .hint b { color:var(--accent); font-weight:600; }
+
+  .fullscreen-hint {
+    position:fixed; bottom:88px; left:50%; transform:translateX(-50%);
+    font-size:12px; color:var(--dim); background:var(--panel);
+    border:1px solid var(--line); border-radius:8px; padding:6px 14px;
+    opacity:0; transition:opacity .3s; pointer-events:none; z-index:25;
+  }
+  .fullscreen-hint.show { opacity:1; }
+
+  /* 音频电平表：实时显示当前响度 + 相对阈值线，一眼看出跟拍状态 */
+  .meter {
+    position:relative; width:120px; height:10px; border-radius:5px;
+    background:rgba(255,255,255,.10); overflow:hidden; flex:0 0 auto;
+  }
+  .meter-fill {
+    position:absolute; left:0; top:0; bottom:0; width:0%;
+    background:linear-gradient(90deg,#3b6ef5,#5ce1a8); transition:width .04s linear;
+  }
+  /* 电平撞过阈值线 → 变亮，一眼看出"这一下会切图" */
+  .meter-fill.hot {
+    background:linear-gradient(90deg,#5ce1a8,#ffce4a);
+    box-shadow:0 0 8px rgba(255,206,74,.55);
+  }
+  .meter-thresh {
+    position:absolute; top:-2px; bottom:-2px; width:2px;
+    background:#ffce4a; box-shadow:0 0 6px #ffce4a;
+    transition: left .08s linear;
+  }
+  /* 固定阈值用另一个颜色，一眼能看出当前是哪种判定 */
+  .meter.fixed .meter-thresh { background:#ff7a59; box-shadow:0 0 6px #ff7a59; }
+  #btnAudioOn.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  /* "正在加载下一张"的提示：只在真的等图时出现 */
+  .loading-hint {
+    position:fixed; top:22px; left:50%; transform:translateX(-50%) translateY(-6px);
+    font-size:12px; color:var(--fg); background:rgba(14,16,20,.92);
+    border:1px solid rgba(255,255,255,.14); border-radius:20px;
+    padding:7px 16px; display:flex; align-items:center; gap:8px;
+    opacity:0; transition:opacity .18s, transform .18s;
+    pointer-events:none; z-index:35;
+  }
+  .loading-hint.show { opacity:1; transform:translateX(-50%) translateY(0); }
+  .loading-hint .dot {
+    width:12px; height:12px; border-radius:50%;
+    border:2px solid rgba(255,255,255,.25); border-top-color:var(--accent);
+    animation:lspin .7s linear infinite;
+  }
+  @keyframes lspin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <div class="layer" id="layerA"></div>
+  <div class="layer" id="layerB" style="opacity:0"></div>
+</div>
+
+<div id="top">
+  <select class="sel" id="src" title="数据源">
+    <option value="comfyui">ComfyUI</option>
+    <option value="webui">WebUI</option>
+  </select>
+  <select class="sel" id="sort" title="排序">
+    <option value="newest">最新</option>
+    <option value="oldest">最旧</option>
+    <option value="random">随机</option>
+    <option value="name">文件名</option>
+  </select>
+  <button class="iconbtn" id="btnCover" title="铺满 / 适应">⛶</button>
+  <div class="spacer"></div>
+  <div class="counter" id="counter">—</div>
+  <button class="iconbtn" id="btnOrder" title="切换方向">⇄</button>
+  <button class="iconbtn" id="btnFull" title="全屏 (F)">⤢</button>
+  <button class="iconbtn" id="btnClose" title="关闭 (Esc)">✕</button>
+</div>
+
+<div id="bar">
+  <!-- ① 播放控制 -->
+  <button class="step" id="btnPrev" title="上一张 (←/↑)">⏮</button>
+  <button class="big" id="btnPlay" title="播放 / 暂停 (空格)">▶</button>
+  <button class="step" id="btnNext" title="下一张 (→/↓)">⏭</button>
+
+  <span class="sep"></span>
+
+  <!-- ② 播放模式 -->
+  <div class="seg" id="sMode">
+    <button data-mode="fps">张/秒</button>
+    <button data-mode="spf">秒/张</button>
+    <button data-mode="adaptive">自适应</button>
+    <button data-mode="audio">🎵 音乐</button>
+  </div>
+  <input type="number" id="numFps" min="0.5" max="60" step="1" value="8">
+  <input type="range" id="rngFps" min="0.5" max="60" step="0.5" value="8">
+  <span class="unit nowrap" id="uFps">张/秒</span>
+
+  <!-- ③ 转场 -->
+  <span class="sep"></span>
+  <select class="sel" id="trans" title="转场效果">
+    <option value="none">瞬切</option>
+    <option value="fade">淡入淡出</option>
+    <option value="slide-lr">左右滑</option>
+    <option value="slide-ud">上下滑</option>
+    <option value="zoom">缩放推拉</option>
+    <option value="flip">翻卡 3D</option>
+    <option value="clock">时钟擦除</option>
+    <option value="blinds">百叶窗</option>
+    <option value="pixel">像素化</option>
+    <option value="pulse">节奏型</option>
+    <option value="random">随机</option>
+  </select>
+  <span class="unit nowrap" id="showFps">—</span>
+
+  <!-- ④ 音频跟拍专属（仅该模式显示） -->
+  <div class="row" id="audiobar" style="display:none">
+    <span class="sep"></span>
+    <button class="step" id="btnAudioOn" style="width:auto;padding:0 9px;border-radius:6px;font-size:11.5px">开始听</button>
+    <div class="seg" id="thrMode" title="阈值判定方式">
+      <button data-mode="dynamic">动态</button>
+      <button data-mode="fixed">固定</button>
+    </div>
+    <span class="unit nowrap" id="aSensLabel">灵敏度</span>
+    <input type="range" id="aSens" min="1" max="50" step="1" value="5" style="width:84px">
+    <span class="unit nowrap" id="aSensVal">5</span>
+    <div class="meter"><div class="meter-fill" id="aLevel"></div><div class="meter-thresh" id="aThresh"></div></div>
+    <span class="unit nowrap" id="aInfo">未启动</span>
+    <span class="unit nowrap" id="aBpm"></span>
+  </div>
+
+  <!-- ⑤ 自适应专属（仅该模式显示） -->
+  <div class="row" id="adaptive" style="display:none">
+    <span class="sep"></span>
+    <span class="hint">按键打节奏 · 第 <b id="advNeed">3</b> 下开播</span>
+    <div class="rhythm" id="beats"></div>
+    <div class="seg" id="rMode">
+      <button data-mode="mean">均值</button>
+      <button data-mode="real">真实值</button>
+      <button data-mode="approx">近似补全</button>
+    </div>
+    <span class="unit">阈值</span>
+    <input type="number" id="advThr" min="2" max="16" step="1" value="3">
+    <span class="unit" id="advInfo">—</span>
+  </div>
+</div>
+
+<div class="fullscreen-hint" id="fsHint">按 F 全屏 · 空格播放/暂停 · 方向键切换</div>
+<div class="loading-hint" id="loadingHint"><span class="dot"></span>正在加载下一张…</div>
+
+<script>window.__API_PREFIX__ = "/gallery4comfyui";</script>
+<script src="/gallery4comfyui/w/slide_rhythm.js"></script>
+<script src="/gallery4comfyui/w/slide_audio.js"></script>
+<script src="/gallery4comfyui/w/slide.js"></script>
+</body>
+</html>

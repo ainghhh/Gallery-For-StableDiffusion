@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>图库 Gallery — 设置</title>
+<style>
+  * { box-sizing: border-box; }
+  :root {
+    --bg:#14161a; --panel:#1a1d23; --line:#262a31; --fg:#e8eaed;
+    --dim:#9aa0a6; --dim2:#6b7280; --accent:#3b6ef5; --bad:#f87171; --ok:#34d399;
+  }
+  html,body { height:100%; margin:0; }
+  body {
+    background:var(--bg); color:var(--fg);
+    font-family:"Microsoft YaHei UI","Segoe UI",sans-serif; font-size:14px;
+    display:flex; align-items:center; justify-content:center;
+    min-height:100vh;
+  }
+  .card {
+    width:min(700px, calc(100vw - 80px));
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:14px; padding:30px 34px;
+    margin:auto;
+  }
+  h1 { font-size:20px; margin:0 0 8px; display:flex; align-items:center; gap:9px; }
+  .sub { color:var(--dim); font-size:13px; line-height:1.75; margin:0 0 24px; }
+  code { background:#242830; padding:1px 6px; border-radius:4px; font-size:12px; }
+  label { display:block; margin:0 0 7px; font-weight:600; font-size:13px; }
+  label .opt { color:var(--dim2); font-weight:400; }
+  label .req { color:var(--bad); }
+  .row { display:flex; gap:9px; margin-bottom:6px; }
+  input {
+    flex:1; min-width:0; background:#12141a; border:1px solid #333840; color:var(--fg);
+    border-radius:8px; padding:10px 12px; font-size:13px;
+    font-family:Consolas,"Microsoft YaHei UI",monospace;
+  }
+  input:focus { outline:none; border-color:var(--accent); }
+  input.bad { border-color:var(--bad); }
+  .hint { color:var(--dim2); font-size:12px; margin:0 0 18px; }
+  .hint.ok::before { content:"✓ "; color:var(--ok); }
+  .hint.err::before { content:"✕ "; color:var(--bad); }
+  button {
+    border:none; border-radius:8px; padding:10px 16px; font-size:13px;
+    font-family:inherit; cursor:pointer; white-space:nowrap;
+  }
+  .pick { background:#2a2f37; color:var(--fg); }
+  .pick:hover { background:#343a44; }
+  .go { background:var(--accent); color:#fff; font-weight:600; padding:12px 34px; }
+  .go:hover { background:#4a7bf7; }
+  .go:disabled { opacity:.5; cursor:default; }
+  .foot {
+    display:flex; justify-content:flex-end; align-items:center; gap:12px;
+    border-top:1px solid var(--line); padding-top:20px; margin-top:8px;
+  }
+  .msg { flex:1; font-size:12px; color:var(--bad); min-height:16px; }
+  .busy { display:flex; align-items:center; gap:10px; color:var(--dim); font-size:13px; }
+  .spin {
+    width:15px; height:15px; border:2px solid #3a4050; border-top-color:var(--accent);
+    border-radius:50%; animation:sp .8s linear infinite;
+  }
+  @keyframes sp { to { transform:rotate(360deg); } }
+  .done { text-align:center; padding:40px 0; }
+  .done .big { font-size:44px; margin-bottom:14px; }
+  .done h2 { font-size:18px; margin:0 0 10px; }
+  .done p { color:var(--dim); font-size:13px; line-height:1.8; margin:0; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+
+  <div id="form">
+    <h1>🗂 图库 Gallery — 目录设置</h1>
+    <p class="sub">
+      告诉图库去哪里找图片。配置存在本软件目录下的 <code>config.json</code>，以后可随时修改。
+    </p>
+
+    <label>ComfyUI 输出目录 <span class="req">*</span></label>
+    <div class="row">
+      <input id="c" placeholder="…\ComfyUI\output" autocomplete="off" spellcheck="false">
+      <button class="pick" data-pick="c">浏览…</button>
+    </div>
+    <div class="hint" id="hc">ComfyUI 出图存放的地方</div>
+
+    <label>SD WebUI 根目录 <span class="opt">（可选）</span></label>
+    <div class="row">
+      <input id="w" placeholder="…\stable-diffusion-webui" autocomplete="off" spellcheck="false">
+      <button class="pick" data-pick="w">浏览…</button>
+    </div>
+    <div class="hint" id="hw">不填就只看 ComfyUI 的图</div>
+
+    <label>画师库数据目录 <span class="opt">（可选）</span></label>
+    <div class="row">
+      <input id="d" placeholder="留空即可" autocomplete="off" spellcheck="false">
+      <button class="pick" data-pick="d">浏览…</button>
+    </div>
+    <div class="hint" id="hd">装了画师库数据的话，指向那份 data 目录</div>
+
+    <div class="foot">
+      <div class="msg" id="err"></div>
+      <button class="go" id="save">开始使用</button>
+    </div>
+  </div>
+
+  <div id="busy" style="display:none">
+    <div class="busy"><div class="spin"></div><span id="busyText">正在准备…</span></div>
+  </div>
+
+  <div id="done" class="done" style="display:none">
+    <div class="big">✅</div>
+    <h2>配置完成</h2>
+    <p id="doneText">图库正在启动…</p>
+  </div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let CFG = {};
+
+// ---------- 桥接：pywebview 可用就直接调，否则退回 HTTP（方便浏览器里调试）----------
+function bridged() { return !!(window.pywebview && window.pywebview.api); }
+async function api(name, ...args) {
+  if (bridged() && typeof window.pywebview.api[name] === "function") {
+    return await window.pywebview.api[name](...args);
+  }
+  const r = await fetch("/gallery4comfyui/api/" + name, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(args.length === 1 && typeof args[0] === "object" ? args[0] : { args }),
+  });
+  return await r.json();
+}
+
+// 让后端/外壳能调这两个（浏览、保存）
+window.setPath = (w, v) => { const e = $(w); if (e) { e.value = v; e.classList.remove("bad"); } };
+
+// ---------- 浏览目录 ----------
+document.querySelectorAll(".pick").forEach(b => {
+  b.addEventListener("click", async () => {
+    const w = b.dataset.pick;
+    const cur = $(w).value.trim();
+    if (bridged() && window.pywebview.api.pick_dir) {
+      const v = await window.pywebview.api.pick_dir(cur);
+      if (v) window.setPath(w, v);
+    } else {
+      // 浏览器调试：手动输入
+      const v = prompt("目录路径：", cur);
+      if (v) window.setPath(w, v);
+    }
+  });
+});
+
+// ---------- 校验 ----------
+function check(inputId) {
+  const el = $(inputId);
+  const hint = $("h" + inputId);
+  if (!el || !hint) return true;
+  const v = el.value.trim();
+  const base = hint.dataset.base || (hint.dataset.base = hint.textContent);
+  if (!v) { hint.className = "hint"; hint.textContent = base; el.classList.remove("bad"); return true; }
+  api("check_dir", v).then(r => {
+    const ok = r && (r.ok || r.exists);
+    hint.className = "hint " + (ok ? "ok" : "err");
+    hint.textContent = ok ? (r.kind ? r.kind : "目录存在") : "找不到这个目录";
+    el.classList.toggle("bad", !ok);
+  }).catch(() => {});
+  return true;
+}
+["c", "w", "d"].forEach(id => {
+  const el = $(id);
+  el.addEventListener("change", () => check(id));
+  el.addEventListener("blur", () => check(id));
+});
+
+// ---------- 保存 ----------
+$("save").addEventListener("click", async () => {
+  const c = $("c").value.trim();
+  if (!c) {
+    $("c").classList.add("bad");
+    $("err").textContent = "请先选择 ComfyUI 输出目录";
+    $("c").focus();
+    return;
+  }
+  $("err").textContent = "";
+  $("form").style.display = "none";
+  $("busy").style.display = "";
+  $("busyText").textContent = "正在保存配置…";
+
+  const w = $("w").value.trim(), d = $("d").value.trim();
+  if (bridged() && window.pywebview.api.save) {
+    const res = await window.pywebview.api.save(c, w, d);
+    if (res && res.ok === false) {
+      $("busy").style.display = "none";
+      $("form").style.display = "";
+      $("err").textContent = res.error || "保存失败";
+      return;
+    }
+  } else {
+    await api("save_dirs", { comfy_output: c, webui_root: w, data_dir: d });
+  }
+
+  $("busyText").textContent = "正在启动图库…";
+  if (bridged() && window.pywebview.api.open_gallery) {
+    await window.pywebview.api.open_gallery();
+  } else {
+    location.href = "/gallery4comfyui/";
+  }
+});
+
+// ---------- 初始化：读出已存的配置填进去 ----------
+(async () => {
+  try {
+    if (bridged() && window.pywebview.api.read_config) {
+      CFG = (await window.pywebview.api.read_config()) || {};
+    } else {
+      CFG = await (await fetch("/gallery4comfyui/api/config")).json();
+    }
+  } catch (e) { CFG = {}; }
+  $("c").value = CFG.comfy_output || "";
+  $("w").value = CFG.webui_root || "";
+  $("d").value = CFG.data_dir || "";
+  if ($("c").value) check("c");
+  if ($("w").value) check("w");
+})();
+</script>
+</body>
+</html>
