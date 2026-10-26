@@ -43,8 +43,6 @@
     border:1px solid rgba(255,255,255,.13);
     border-radius:15px;
     box-shadow:0 10px 34px rgba(0,0,0,.52);
-    backdrop-filter:blur(18px) saturate(1.25);
-    -webkit-backdrop-filter:blur(18px) saturate(1.25);
     transition: opacity .28s ease, transform .28s ease;
   }
 
@@ -75,12 +73,10 @@
     /* 紧凑：一行装下所有控件 */
     display:flex; align-items:center; gap:10px;
     padding:7px 12px;
-    background:rgba(14,16,20,.92);
+    background:rgba(14,16,20,.985);
     border:1px solid rgba(255,255,255,.13);
     border-radius:12px;
     box-shadow:0 10px 32px rgba(0,0,0,.6), 0 2px 6px rgba(0,0,0,.4);
-    backdrop-filter:blur(18px) saturate(1.25);
-    -webkit-backdrop-filter:blur(18px) saturate(1.25);
     transition: opacity .24s ease, transform .24s ease;
     white-space:nowrap;
   }
@@ -208,7 +204,7 @@
   /* "正在加载下一张"的提示：只在真的等图时出现 */
   .loading-hint {
     position:fixed; top:22px; left:50%; transform:translateX(-50%) translateY(-6px);
-    font-size:12px; color:var(--fg); background:rgba(14,16,20,.92);
+    font-size:12px; color:var(--fg); background:rgba(14,16,20,.985);
     border:1px solid rgba(255,255,255,.14); border-radius:20px;
     padding:7px 16px; display:flex; align-items:center; gap:8px;
     opacity:0; transition:opacity .18s, transform .18s;

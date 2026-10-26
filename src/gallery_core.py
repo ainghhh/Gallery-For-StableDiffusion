@@ -355,21 +355,49 @@ def _parse_lora_json_field(text):
     return names
 
 
+_LORA_EXTS_TUPLE = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".onnx", ".gguf")
+
+
+def _node_lora_name(inp):
+    """从节点输入里取这个节点实际加载的 LoRA 名。
+
+    判定改用**约定**而不是白名单：ComfyUI 里 LoRA 加载节点的标志性输入就叫
+    `lora_name`（字符串）。原来只认 `LoraLoader` / `LoraLoaderModelOnly` 两个类名，
+    结果 AnimaLoraFilter、各种第三方 LoRA 节点全被漏掉 —— 表现为
+    LoRA 下拉里每个都是「0 张图」，按 LoRA 筛选永远空。
+    """
+    if not isinstance(inp, dict):
+        return ""
+    # 显式关闭的节点不算（AnimaLoraFilter 这类带 enabled 开关）
+    for k in ("enabled", "switch", "active", "is_enabled"):
+        if k in inp and inp[k] is False:
+            return ""
+    # override 优先（空串表示不覆盖）
+    ov = inp.get("lora_name_override")
+    if isinstance(ov, str) and ov.strip():
+        return ov.strip()
+    v = inp.get("lora_name")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return ""
+
+
 def _extract_loras(prompt, workflow):
     """从 ComfyUI prompt / workflow 提取 LoRA 名列表（原始未规范化）
-    - 标准 LoRA 节点：LoraLoader / LoraLoaderModelOnly，取 inputs.lora_name（字符串）
-    - Weilin/Anima 堆叠节点：从 widgets 的 lora 列表 JSON 解析，仅取激活（hidden!=true）的 lora
-    - workflow: 仅精确匹配节点类型，从 widgets_values 里找第一个合法字符串作 lora_name
-    不做 class_type 含 'lora' 的宽松匹配（避免把 ControlNet-Lora 等非 LoraLoader 节点误判为 LoRA）。
+
+    - **任何带 `lora_name` 字符串输入的节点**都算 LoRA 加载节点
+      （覆盖 LoraLoader / LoraLoaderModelOnly / AnimaLoraFilter / 第三方节点）
+    - WeiLin/Anima 堆叠节点：从 widgets 的 lora 列表 JSON 解析，仅取激活（hidden!=true）的
+    - workflow：节点类型含 lora，就从 widgets_values 里找像模型文件的字符串
     """
     loras = []
     if isinstance(prompt, dict):
         for node in prompt.values():
             ct = str(node.get("class_type", "")).lower()
             i = node.get("inputs", {}) or {}
-            v = i.get("lora_name")
-            if ct in _LORA_NODE_TYPES and isinstance(v, str):
-                loras.append(v)
+            got = _node_lora_name(i)
+            if got:
+                loras.append(got)
             elif any(h in ct for h in _LORA_STACK_NODE_HINTS):
                 # 堆叠节点：从 lora_str / lora_list_json / temp_lora_str 解析激活的 lora
                 for key in ("lora_list_json", "lora_str"):
@@ -379,14 +407,22 @@ def _extract_loras(prompt, workflow):
             for n in workflow.get("nodes", []):
                 t = str(n.get("type", "")).lower()
                 wv = n.get("widgets_values") or []
-                if t in _LORA_NODE_TYPES:
+                if t in _LORA_NODE_TYPES or "lora" in t:
                     for item in wv:
-                        if isinstance(item, str) and len(item) > 2 and not item.startswith("{") and " " not in item.strip():
+                        if isinstance(item, str) and item.lower().endswith(_LORA_EXTS_TUPLE):
                             loras.append(item)
                             break
-                elif any(h in t for h in _LORA_STACK_NODE_HINTS):
+                    else:
+                        # 没有扩展名时退回原来的启发式
+                        if t in _LORA_NODE_TYPES:
+                            for item in wv:
+                                if (isinstance(item, str) and len(item) > 2
+                                        and not item.startswith("{")
+                                        and " " not in item.strip()):
+                                    loras.append(item)
+                                    break
+                if any(h in t for h in _LORA_STACK_NODE_HINTS):
                     # 堆叠节点：widgets[0]=激活列表(lora_str), widgets[1]=临时列表(temp_lora_str)
-                    # 优先用第一个（当前激活）的 JSON
                     for item in wv:
                         if isinstance(item, list):
                             loras.extend(_parse_lora_json_field(item))

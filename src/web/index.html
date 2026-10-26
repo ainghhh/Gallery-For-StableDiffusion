@@ -27,10 +27,42 @@
   .modal .pos::-webkit-scrollbar{width:8px}
   body{background:var(--bg); color:var(--txt); font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif; font-size:14px; transition:background .2s}
   button{font-family:inherit}
-  .topbar{background:color-mix(in srgb, var(--card) 92%, transparent); backdrop-filter:blur(6px); border-bottom:1px solid var(--line); padding:9px 16px}
+  /* 注意：这里**不要**加 backdrop-filter —— sticky + 背景模糊会让 WebView2
+   出现"一块区域不刷新"的瓦片失效，必须切窗口才恢复。用接近实色代替。 */
+  .topbar{background:var(--card); border-bottom:1px solid var(--line); padding:9px 16px}
   .tb-inner{max-width:1320px; margin:0 auto; display:flex; align-items:center; gap:9px; flex-wrap:wrap}
   .title{font-size:16px; font-weight:600; margin-right:4px}
   .title small{font-weight:400; color:var(--dim); font-size:12px; margin-left:5px}
+  /* 列表刷新中：旧内容轻微变暗、不响应点击，避免误点 */
+  #grid.refreshing{ opacity:.55; pointer-events:none; transition: opacity .16s var(--ease-out); }
+
+  /* ── 缩略图：加载前是骨架底色，加载完成后淡入（避免"啪"地跳出） ── */
+  .item .thumb{
+    opacity: 0;
+    transform: scale(1.012);
+    transition: opacity .28s var(--ease-out), transform .34s var(--ease-out);
+    background: linear-gradient(100deg,
+      color-mix(in srgb, var(--line) 55%, transparent) 25%,
+      color-mix(in srgb, var(--line) 85%, transparent) 37%,
+      color-mix(in srgb, var(--line) 55%, transparent) 63%);
+    background-size: 300% 100%;
+    animation: skel 1.3s ease-in-out infinite;
+  }
+  .item .thumb.in{ opacity: 1; transform: scale(1); animation: none; background: none; }
+  @keyframes skel{
+    0%   { background-position: 100% 0; }
+    100% { background-position: -100% 0; }
+  }
+  /* 画师卡封面 / 作品弹窗里的小图同样处理 */
+  .ac-cover .thumb, .awm-item .thumb, .ai-grid .thumb{ opacity: 1; transform: none; background: none; animation: none; }
+
+  /* 常驻工具栏里的迷你控件（排序 / 网格） */
+  .tb-sep{width:1px; height:18px; background:var(--line); flex:0 0 auto; margin:0 2px}
+  .tb-mini-label{font-size:11.5px; color:var(--dim); flex:0 0 auto}
+  .tb-mini{
+    padding:4px 8px !important; font-size:12px !important; border-radius:7px !important;
+    max-width:96px; flex:0 0 auto;
+  }
   .ver-tag{font-size:10px; color:var(--dim); background:var(--bg); border:1px solid var(--line); border-radius:5px; padding:1px 6px; margin-right:2px; opacity:.75}
   input, select{background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; font-size:13.5px; color:var(--txt); outline:none; font-family:inherit}
   input:focus, select:focus{border-color:var(--accent)}
@@ -275,7 +307,7 @@
   .modal .btns button:hover{border-color:var(--accent); color:var(--accent)}
   .modal .btns button.primary{background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600}
   .modal .btns button.primary:hover{opacity:.9; color:#fff}
-  .modal .close{position:absolute; top:14px; right:20px; width:34px; height:34px; border-radius:50%; background:rgba(255,255,255,.14); color:#fff; font-size:17px; cursor:pointer; z-index:6; display:flex; align-items:center; justify-content:center; line-height:1; backdrop-filter:blur(4px); transition:.15s}
+  .modal .close{position:absolute; top:14px; right:20px; width:34px; height:34px; border-radius:50%; background:rgba(255,255,255,.14); color:#fff; font-size:17px; cursor:pointer; z-index:6; display:flex; align-items:center; justify-content:center; line-height:1; transition:.15s}
   .modal .close:hover{background:rgba(255,255,255,.28)}
   .modal .nav{position:absolute; top:50%; transform:translateY(-50%); width:42px; height:56px; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,.07); color:rgba(255,255,255,.85); cursor:pointer; font-size:26px; user-select:none; z-index:5; border-radius:10px; transition:.15s}
   .modal .nav:hover{background:rgba(255,255,255,.18); color:#fff}
@@ -596,12 +628,15 @@
   }
 
   /* ── 卡片入场：淡入 + 轻微上浮（只做一次，不拖慢首屏） ── */
-  .grid > .item, .grid .item {
-    animation: cardIn .30s var(--ease-out) both;
+  /* 只对前 24 张做淡入：一次性给 60 张加 transform 动画会建几十个合成层，
+     低显存机器上容易触发瓦片回收（表现就是"某块区域不刷新"）。
+     只做 opacity 不升级图层，视觉几乎一样但便宜得多。 */
+  .grid .item:nth-child(-n+24) {
+    animation: cardIn .26s var(--ease-out) both;
   }
   @keyframes cardIn {
-    from { opacity: 0; transform: translateY(8px) scale(.985); }
-    to   { opacity: 1; transform: translateY(0) scale(1); }
+    from { opacity: 0; }
+    to   { opacity: 1; }
   }
 
   /* ── 弹窗/灯箱：淡入 + 放大落定 ── */
@@ -695,6 +730,15 @@
     </div>
     <button class="iconbtn" id="btnPackLora" title="打包此 LoRA 全部图片（按大模型分子目录）"><span class="ic" data-ic="package"></span><span data-i18n="packLora">LoRA</span></button>
     <button class="iconbtn" id="btnAdv" data-i18n-title="titleFilter" title="筛选"><span class="ic" data-ic="filter"></span><span data-i18n="btnAdv2">筛选</span></button>
+    <span class="tb-sep"></span>
+    <span class="tb-mini-label" data-i18n="fSort">排序</span>
+    <select class="tb-mini" id="sortSel" title="排序">
+      <option value="newest" data-i18n="sNewest">最新</option><option value="oldest" data-i18n="sOldest">最旧</option><option value="random" data-i18n="sRandom">随机</option><option value="name" data-i18n="sName">文件名</option>
+    </select>
+    <span class="tb-mini-label" data-i18n="fGrid">网格</span>
+    <select class="tb-mini" id="densitySel" title="网格密度">
+      <option value="md" data-i18n="gMd">中</option><option value="sm" data-i18n="gSm">小</option><option value="lg" data-i18n="gLg">大</option>
+    </select>
     <button class="iconbtn" id="btnStats" data-i18n-title="titleStats" title="统计"><span class="ic" data-ic="stats"></span></button>
     <button class="iconbtn" id="btnQuickRefresh" data-i18n="quickRefresh" data-i18n-title="titleQuickRefresh" title="↻ 只检查新增图片（与重进页面相同）">↻ 新增</button>
     <button class="iconbtn" id="btnRefreshComfy" title="强制重建 ComfyUI 索引"><span class="ic" data-ic="refresh"></span><span data-i18n="refreshComfy">ComfyUI</span></button>
@@ -721,13 +765,6 @@
     <div class="f"><label data-i18n="fCfgLe">CFG ≤</label><input type="number" id="cfgMax" step="0.5" placeholder="—"></div>
     <div class="f"><label data-i18n="fWGe">宽 ≥</label><input type="number" id="minW" placeholder="—"></div>
     <div class="f"><label data-i18n="fHGe">高 ≥</label><input type="number" id="minH" placeholder="—"></div>
-    <div class="f"><label data-i18n="fSort">排序</label><select id="sortSel">
-      <option value="newest" data-i18n="sNewest">最新</option><option value="oldest" data-i18n="sOldest">最旧</option>
-      <option value="random" data-i18n="sRandom">随机</option><option value="name" data-i18n="sName">文件名</option>
-    </select></div>
-    <div class="f"><label data-i18n="fGrid">网格</label><select id="densitySel">
-      <option value="md" data-i18n="gMd">中</option><option value="sm" data-i18n="gSm">小</option><option value="lg" data-i18n="gLg">大</option>
-    </select></div>
     <div class="f"><label data-i18n="fPerPage">每页</label><select id="pageSizeSel">
       <option value="30">30</option><option value="60" selected>60</option>
       <option value="120">120</option><option value="240">240</option>
@@ -1246,6 +1283,8 @@ const I18N = {
     setupPathPh: "尚未选择目录", browse: "浏览…", save: "保存", skip: "跳过",
     setupSaved: "✅ 已保存", setupValid: "✅ 目录有效，已保存",
     fsTitle: "选择目录", fsUp: "上级目录", fsSelect: "选择此目录", fsCancel: "取消", fsNew: "新建文件夹",
+  fsDrives: "选择盘符（双击可直接选中）", fsEmpty: "空目录", fsPickHint: "先进入一个文件夹再选择",
+  packNoSel: "还没选图：在图片空白处按住拖一个框框选，或按住 Ctrl 点图多选",
     fsPickDrive: "选择盘符", fsEmpty: "空目录",
     statTitle: "模型分布（", statTotal: "张）",
     aiCopy: "复制", aiAdd: "加入", aiInfo: "ℹ 简介",
@@ -1334,6 +1373,8 @@ const I18N = {
     setupPathPh: "No folder selected", browse: "Browse…", save: "Save", skip: "Skip",
     setupSaved: "✅ Saved", setupValid: "✅ Valid folder, saved",
     fsTitle: "Select Folder", fsUp: "Parent", fsSelect: "Select folder", fsCancel: "Cancel", fsNew: "New folder",
+  fsDrives: "Pick a drive (double-click to select)", fsEmpty: "Empty folder", fsPickHint: "Enter a folder first",
+  packNoSel: "Nothing selected: drag a box on empty space, or Ctrl+click images",
     fsPickDrive: "Choose a drive", fsEmpty: "Empty folder",
     statTitle: "Model distribution (", statTotal: " images)",
     aiCopy: "Copy", aiAdd: "Add", aiInfo: "ℹ Profile",
@@ -1448,6 +1489,12 @@ applyLang();
 var _sideCurTop = null;      // 当前实际像素位置（插值用）
 var _sideRaf = null;
 function showView(which){
+  // 切视图后强制一次重绘：Chromium/WebView2 在合成层较多时，
+  // 偶尔会留下一块【旧画面】不刷新，主动触发 reflow + repaint 可避免。
+  document.body.style.transform = 'translateZ(0)';
+  void document.body.offsetHeight;
+  document.body.style.transform = '';
+
   $("mainView").hidden = which !== "main";
   $("favView").hidden = which !== "fav";
   const isArtistArea = (which === "artist" || which === "artlib");
@@ -1648,7 +1695,14 @@ function mainLbCtx(qp, items, pageNo){
   };
 }
 async function load(reset){
-  if(reset){ PAGE = 1; $("grid").innerHTML = '<div class="empty">' + t("loading") + '</div>'; }
+  if(reset){
+    PAGE = 1;
+    // 别立刻把网格清成"加载中"：旧图直接抹掉再填回去，中间会闪一屏空白，
+    // 视觉上一顿一顿的。只有网格本来就是空的时候才显示占位。
+    const g0 = $("grid");
+    if(!g0.querySelector(".item")) g0.innerHTML = '<div class="empty">' + t("loading") + '</div>';
+    else g0.classList.add("refreshing");
+  }
   // WebUI 源未配置：直接提示，不死循环
   if(SRC === "webui" && !CFG_WEBUI){
     $("grid").innerHTML = '<div class="empty">' + t("notCfgWebui") + '<br><br>' + t("noCfgHint") + '</div>';
@@ -1664,14 +1718,19 @@ async function load(reset){
     if(seq !== LOAD_SEQ) return;                  // 已被更新的请求取代，丢弃这次响应
     TOTAL = r.total; TOTAL_PAGES = Math.max(1, Math.ceil(r.total / PAGE_SIZE));
     $("count").textContent = (t("countTotal") ? t("countTotal") + " " : "") + TOTAL + (t("countOf") ? " " + t("countOf") : "");
-    const grid = $("grid"); grid.innerHTML = "";
+    const grid = $("grid"); grid.innerHTML = ""; grid.classList.remove("refreshing");
     if(!r.total) grid.innerHTML = '<div class="empty">' + (r.ready ? t("noImage") : t("building")) + '</div>';
     CUR_ITEMS = r.items;
     const ctx = mainLbCtx(qp, r.items, PAGE);
     r.items.forEach(it=>{ grid.appendChild(mkItem(it, SRC, r.items, ctx)); });
     renderPager();
     if(!r.ready) setTimeout(()=>{ if(seq === LOAD_SEQ) load(false); }, 3000);
-  }catch(e){ if(seq === LOAD_SEQ) $("loading").textContent = t("loading") + " ✖"; }
+  }catch(e){
+    if(seq === LOAD_SEQ){
+      $("loading").textContent = t("loading") + " ✖";
+      $("grid").classList.remove("refreshing");
+    }
+  }
   finally{ if(seq === LOAD_SEQ) LOADING = false; }
 }
 function mkItem(it, src, items, ctx){
@@ -1682,9 +1741,17 @@ function mkItem(it, src, items, ctx){
   if(DEFAULT_FAVS.has(key)) d.classList.add("faved");
   const isVideo = it.type === "video" || /\.(mp4|webm|mov|mkv|avi|gif)$/i.test(it.file || "");
   const media = isVideo ? document.createElement("video") : document.createElement("img");
+  media.className = "thumb" + (isVideo ? " is-video" : "");
   media.src = imgUrl(src, it.file);
   media.loading = "lazy";
+  // 解码放到后台，避免图片一到位就卡主线程（滚动时尤其明显）
+  try{ media.decoding = "async"; }catch(e){}
   if(isVideo){ media.muted = true; media.playsInline = true; media.preload = "metadata"; }
+  // 加载完成才淡入；已经缓存过的直接标记，避免闪一下再淡入
+  const markLoaded = ()=>{ media.classList.add("in"); };
+  if(media.complete && media.naturalWidth) markLoaded();
+  else media.addEventListener(isVideo ? "loadeddata" : "load", markLoaded, { once: true });
+  media.addEventListener("error", markLoaded, { once: true });
   const badge = document.createElement("div"); badge.className = "badge"; badge.textContent = it.model || "";
   const meta = document.createElement("div"); meta.className = "meta";
   const p2 = it.params || {};
@@ -1703,8 +1770,14 @@ function mkItem(it, src, items, ctx){
   }
   const fm = document.createElement("span"); fm.className = "favmark"; fm.textContent = "★";
   d.appendChild(badge); d.appendChild(media); d.appendChild(meta); d.appendChild(fm);
-  d.onclick = ()=>{
-    if(SEL.size){ toggleSel(d, it, src); updateSelBars(); return; }
+  d.onclick = (e)=>{
+    // Ctrl / Shift / 已有选中 → 切换选中，不进灯箱。
+    // 原来只有"拉框"能开始多选，普通点一下永远进灯箱，用户以为不能多选。
+    if(e && (e.ctrlKey || e.metaKey || e.shiftKey) || SEL.size){
+      toggleSel(d, it, src); updateSelBars();
+      if(e) e.preventDefault();
+      return;
+    }
     const list = items || CUR_ITEMS;
     const idx = Math.max(0, list.indexOf(it));
     if(ctx){
@@ -2948,10 +3021,14 @@ $("btnSetupSave").onclick = async ()=>{
 };
 // 目录选择器
 let FS_PATH = "";
-async function fsShowDrives(){
+let FS_DRIVES_MODE = false;   // 当前显示的是"盘符列表"
+async function fsShowDrives(useLast){
   FS_PATH = "";
-  // 位置记忆：优先进入上次使用的目录
-  const last = localStorage.getItem("gallery4comfyui-lastdir") || "";
+  FS_DRIVES_MODE = true;
+  // 位置记忆：**只有主动打开选择器时**才跳到上次目录。
+  // 从盘符根目录点「上级」时不能跳 —— 否则会立刻被弹回上次目录，
+  // 表现就是"想换到 C 盘却怎么都回不到盘符列表"。
+  const last = useLast ? (localStorage.getItem("gallery4comfyui-lastdir") || "") : "";
   if(last){
     try{
       const r = await api("/api/fs/list?path=" + encodeURIComponent(last) + "&scope=any");
@@ -2960,38 +3037,56 @@ async function fsShowDrives(){
   }
   const r = await api("/api/fs/drives");
   const box = $("fsList"); box.innerHTML = "";
-  $("fsPath").textContent = "选择盘符";
-  r.drives.forEach(d=>{
+  $("fsPath").textContent = t("fsDrives") || "选择盘符";
+  (r.drives || []).forEach(d=>{
     const row = document.createElement("div"); row.className = "fs-row";
     row.innerHTML = `<span class="ic">💽</span>${d}`;
+    // 点盘符：进入该盘根目录
     row.onclick = ()=>fsEnter(d);
+    // 双击盘符 = 直接选这个盘
+    row.ondblclick = ()=>{ FS_PATH = d; fsPickNow(); };
     box.appendChild(row);
   });
+  syncFsButtons();
 }
 async function fsEnter(path){
   const r = await api("/api/fs/list?path=" + encodeURIComponent(path) + "&scope=any");
   if(r.error){ alert(r.error); return; }
   FS_PATH = r.path;
+  FS_DRIVES_MODE = false;
   try{ localStorage.setItem("gallery4comfyui-lastdir", r.path); }catch(e){}
   $("fsPath").textContent = r.path;
   const box = $("fsList"); box.innerHTML = "";
   (r.dirs||[]).forEach(d=>{
     const row = document.createElement("div"); row.className = "fs-row";
-    row.innerHTML = `<span class="ic">📁</span><span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">${esc(d.name)}</span>${d.has_outputs?'<span class="tag">${t("hasOutputs")}</span>':''}${d.has_models?'<span class="tag">${t("hasModels")}</span>':''}`;
+    row.innerHTML = `<span class="ic">📁</span><span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">${esc(d.name)}</span>${d.has_outputs?'<span class="tag">'+t("hasOutputs")+'</span>':''}${d.has_models?'<span class="tag">'+t("hasModels")+'</span>':''}`;
     row.onclick = ()=>fsEnter(r.path + "\\" + d.name);
     box.appendChild(row);
   });
-  if(!(r.dirs||[]).length) box.innerHTML = '<div class="empty">空目录</div>';
+  if(!(r.dirs||[]).length) box.innerHTML = '<div class="empty">'+(t("fsEmpty")||"空目录")+'</div>';
+  syncFsButtons();
 }
-$("btnBrowse").onclick = ()=>{ $("fsPicker").classList.add("show"); fsShowDrives(); };
+/** 「选择此目录」按钮的可用状态 —— 盘符列表时不能选，避免"点了没反应" */
+function syncFsButtons(){
+  const b = $("fsSelect");
+  if(!b) return;
+  const ok = !!FS_PATH && !FS_DRIVES_MODE;
+  b.disabled = !ok;
+  b.style.opacity = ok ? "1" : ".45";
+  b.style.cursor = ok ? "pointer" : "not-allowed";
+  b.title = ok ? (FS_PATH || "") : (t("fsPickHint") || "先进入一个文件夹再选择");
+}
+$("btnBrowse").onclick = ()=>{ $("fsPicker").classList.add("show"); fsShowDrives(true); };
 $("fsUp").onclick = async ()=>{
-  if(!FS_PATH) return;
-  const parent = (await api("/api/fs/list?path=" + encodeURIComponent(FS_PATH) + "&scope=any")).parent;
-  if(parent) fsEnter(parent);
-  else fsShowDrives();
+  if(!FS_PATH || FS_DRIVES_MODE){ fsShowDrives(false); return; }
+  try{
+    const r = await api("/api/fs/list?path=" + encodeURIComponent(FS_PATH) + "&scope=any");
+    if(r && r.parent) fsEnter(r.parent);
+    else fsShowDrives(false);      // 已到盘符根 → 回到盘符列表（不自动跳回）
+  }catch(e){ fsShowDrives(false); }
 };
-$("fsSelect").onclick = ()=>{
-  if(!FS_PATH) return;
+function fsPickNow(){
+  if(!FS_PATH || FS_DRIVES_MODE) return;
   if(FS_MODE === "pack" && FS_PICK_CB){
     const cb = FS_PICK_CB; FS_PICK_CB = null; FS_MODE = "setup";
     $("fsPicker").classList.remove("show");
@@ -3000,7 +3095,8 @@ $("fsSelect").onclick = ()=>{
     $("setupPath").value = FS_PATH;
     $("fsPicker").classList.remove("show");
   }
-};
+}
+$("fsSelect").onclick = ()=>fsPickNow();
 $("fsCancel").onclick = ()=>{ FS_PICK_CB = null; FS_MODE = "setup"; $("fsPicker").classList.remove("show"); };
 
 // ---------- 打包 ----------
@@ -3035,7 +3131,7 @@ function packImages(payload){
       else { showToast("❌ " + (j.error || ("打包失败 (" + r.status + ")"))); }
     }catch(e){ showToast("❌ 打包失败（" + (e.message||e) + "）"); }
   };
-  $("fsPicker").classList.add("show"); fsShowDrives();
+  $("fsPicker").classList.add("show"); fsShowDrives(true);
 }
 $("fsNew").onclick = async ()=>{
   if(!FS_PATH){ alert("请先进入一个目录"); return; }
@@ -3052,11 +3148,20 @@ function updateSelBars(){
     b.hidden = !n; if(n) $(cid).textContent = t("favSelCount") + " " + n;
   });
 }
-$("gPackSel").onclick = ()=>{ if(SEL.size) packImages({items: selItems()}); };
-$("selPack").onclick = ()=>{ if(SEL.size) packImages({items: selItems()}); };
-$("agPackSel").onclick = ()=>{ if(SEL.size) packImages({items: selItems()}); };
+$("gPackSel").onclick = packSelected;
+$("selPack").onclick = packSelected;
+$("agPackSel").onclick = packSelected;
 $("gPackAll").onclick = ()=>packImages({query: mainQuery()});
 $("agPackAll").onclick = ()=>packImages({query: advQuery()});
+/** 打包选中。没选任何图时明确告诉用户怎么选 —— 原来这里是 if(SEL.size) 静默空转，
+ *  点了完全没反应，看起来像按钮坏了。 */
+function packSelected(){
+  if(!SEL.size){
+    showToast(t("packNoSel") || "还没选图：在图片空白处按住拖一个框框选，或按住 Ctrl 点图多选");
+    return;
+  }
+  packImages({items: selItems()});
+}
 $("gSelClear").onclick = ()=>{ SEL.clear(); updateSelBars(); $("grid").querySelectorAll(".item.sel").forEach(d=>d.classList.remove("sel")); };
 $("agSelClear").onclick = ()=>{ SEL.clear(); updateSelBars(); $("agGrid").querySelectorAll(".item.sel").forEach(d=>d.classList.remove("sel")); };
 // ---------- 拉框多选（主图库 + 高级搜索）----------
@@ -3209,7 +3314,7 @@ function renderArtists(){
     const whtml = `<div class="ac-weight" title="${LANG === "zh" ? "默认权重" : "default weight"}">${LANG === "zh" ? "⚖ " : "⚖ "}${w.toFixed(2)}${inSide ? " ·★" : ""}</div>`;
     d.innerHTML = `
       <div class="ac-cover">
-        <img src="${coverSrc}" loading="lazy" alt="">
+        <img class="thumb" src="${coverSrc}" loading="lazy" alt="">
         <button class="ac-arrow ac-prev">‹</button>
         <button class="ac-arrow ac-next">›</button>
         <span class="ac-idx">${(ART_COVER_IDX[key]||0) + 1}/${artCountMax(a)}</span>
@@ -3440,8 +3545,22 @@ function renderAiGrid(){
     d.className = "item";
     const isVideo = it.type === "video" || /\.(mp4|webm|mov|mkv|avi|gif)$/i.test(it.file||"");
     d.style.position = "relative";
-    d.innerHTML = `<img src="${imgUrl("comfyui", it.file)}" loading="lazy" alt="">${isVideo ? '<span class="ai-it-ic">🎬</span>' : ""}`;
-    d.onclick = ()=>{ aiOpenBig(it); };
+    d.innerHTML = `<img class="thumb" src="${imgUrl("comfyui", it.file)}" loading="lazy" alt="">${isVideo ? '<span class="ai-it-ic">🎬</span>' : ""}`;
+    d.onclick = async ()=>{
+      aiOpenBig(it);            // 弹窗内先放大（保留原有体验）
+      // 同时进灯箱：以"该画师这批作品"为上下文，左右键可连续翻
+      const idx = (AI.works || []).indexOf(it);
+      lbUseCtx({
+        pbuf: { 1: AI.works || [] },
+        key: "ai:" + ((AI.item && AI.item.name) || ""),
+        grid: "aiGrid", psize: Math.max(1, (AI.works || []).length),
+        total: (AI.works || []).length, src: "comfyui",
+        page: () => 1,
+        loader: async () => AI.works || [],
+        sync: () => {},
+      });
+      try{ await lbShow(Math.max(0, idx)); }catch(e){}
+    };
     grid.appendChild(d);
   });
   const n = $("aiGridCount");
@@ -3703,8 +3822,24 @@ function renderAWM(){
   if(!AWM.items.length){ grid.innerHTML = '<div class="empty">' + (LANG === "zh" ? "没有作品" : "No works") + '</div>'; return; }
   AWM.items.forEach(it=>{
     const d = document.createElement("div"); d.className = "item awm-item" + (AWM.selFile === it.file ? " sel" : "");
-    d.innerHTML = `<img src="${imgUrl("comfyui", it.file)}" loading="lazy" alt=""><div class="badge">${esc(it.model||"")}</div>`;
-    d.onclick = ()=>{ AWM.selFile = it.file; awmShowMeta(it); renderAWM(); };
+    d.innerHTML = `<img class="thumb" src="${imgUrl("comfyui", it.file)}" loading="lazy" alt=""><div class="badge">${esc(it.model||"")}</div>`;
+    d.onclick = async ()=>{
+      // 先更新右侧参数面板
+      AWM.selFile = it.file; awmShowMeta(it); renderAWM();
+      // 再进灯箱：以「当前这一页作品」作为灯箱上下文，
+      // 这样左右键可以在本页作品间连续翻（原来是点了没反应，只能看右边小预览）
+      const idx = AWM.items.indexOf(it);
+      lbUseCtx({
+        pbuf: { 1: AWM.items },
+        key: "awm:" + (AWM.tag || "") + ":" + ($("awmSort") ? $("awmSort").value : "newest"),
+        grid: "awmGrid", psize: Math.max(1, AWM.items.length),
+        total: AWM.items.length, src: "comfyui",
+        page: () => 1,
+        loader: async () => AWM.items,
+        sync: () => {},
+      });
+      try{ await lbShow(Math.max(0, idx)); }catch(e){}
+    };
     grid.appendChild(d);
   });
   // 分页
