@@ -203,7 +203,32 @@ def read_png_texts(path):
 _PARSE_VERSION = 4
 _TEXT_KEYS = ("resolved_prompt", "positive", "text_0", "text", "prompt", "string_a", "string_b",
               "artist_tags", "character_tags", "clothing_tags", "background_tags", "pose_tags",
-              "extra_text", "top_copyrights", "signature_tags", "lora_str")
+              "extra_text", "top_copyrights", "signature_tags", "lora_str",
+              # 常见第三方节点的文本键名（每加一个就多认一类工作流）
+              "prompt_text", "positive_prompt", "negative_prompt", "text_input",
+              "text_g", "text_l", "clip_l", "t5xxl", "content", "value", "string",
+              "wildcard_text", "prompt_string", "main_prompt", "user_prompt")
+
+# 看着像文件名的值不要当提示词（模型/VAE/LoRA 名会误伤）
+_FILE_LIKE_EXT = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf",
+                  ".onnx", ".vae", ".png", ".jpg", ".jpeg", ".webp", ".mp4")
+
+
+def _looks_like_prompt(v):
+    """粗略判断一个字符串像不像提示词（用于"不认识的自定义节点"兜底）。"""
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if len(t) < 4:
+        return False
+    low = t.lower()
+    if low.endswith(_FILE_LIKE_EXT):
+        return False
+    if t.startswith("{") or t.startswith("["):     # JSON 片段
+        return False
+    if "\n" in t or "," in t or " " in t:          # 有分隔才算"一段话"
+        return True
+    return len(t) >= 12                            # 单个长词也行
 
 
 def _resolve_text(prompt, nid, depth=0, seen=None):
@@ -273,8 +298,9 @@ def _resolve_text(prompt, nid, depth=0, seen=None):
             r = _resolve_text(prompt, v[0], depth + 1, seen | {nid})
             if r:
                 return r
-        elif isinstance(v, str) and len(v) > 40:
-            # 非文本键的短杂值（append/trigger/false 等）不算提示词
+        elif _looks_like_prompt(v):
+            # 不认识的自定义节点：挑一个最像提示词的字符串。
+            # （原来要求 >40 字，很多短提示词/短 tag 串会被漏掉）
             return v
     return ""
 
@@ -391,7 +417,7 @@ def _extract_comfyui(prompt, workflow):
         # 1) 首选 · 直接盯 KSampler：positive/negative 输入链回溯 = 真正喂给模型的最终提示词
         pos_best, neg_best = "", ""
         for nid, node in prompt.items():
-            if node.get("class_type") not in ("KSampler", "KSamplerAdvanced"):
+            if not _is_sampler_node(node):
                 continue
             i = node.get("inputs", {}) or {}
             p = i.get("positive")
@@ -442,15 +468,29 @@ def _extract_comfyui(prompt, workflow):
         for node in prompt.values():
             ct = node.get("class_type", "")
             i = node.get("inputs", {})
-            if ct in ("KSampler", "KSamplerAdvanced"):
-                for k in ("seed", "steps", "cfg", "sampler_name", "scheduler", "denoise", "noise_seed"):
+            if _is_sampler_node(node):
+                for k in ("seed", "steps", "cfg", "sampler_name", "scheduler",
+                          "denoise", "noise_seed"):
                     if k in i:
                         info["params"][k] = i[k]
                 # 统一采样器键名：SD WebUI 用 "sampler"，ComfyUI 是 "sampler_name"
                 if "sampler_name" in i:
                     info["params"]["sampler"] = i["sampler_name"]
-            elif ct == "EmptyLatentImage":
-                # 只认**真正在用的**那条链的起点（可能有多段采样 + 放大）
+            elif ct in ("BasicScheduler", "KSamplerSelect", "CFGGuider",
+                        "RandomNoise", "SamplerCustom", "SamplerCustomAdvanced"):
+                # 现代 ComfyUI（Flux/SD3 常见）把采样拆成多个小节点：
+                #   RandomNoise(noise_seed) + KSamplerSelect(sampler_name)
+                #   + BasicScheduler(steps/scheduler/denoise) + CFGGuider(cfg)
+                # 不认这几个的话，这类工作流会完全没有步数/CFG/采样器。
+                for k in ("steps", "scheduler", "denoise", "sampler_name",
+                          "cfg", "noise_seed", "seed"):
+                    if k in i and info["params"].get(k) in (None, ""):
+                        info["params"][k] = i[k]
+                if "sampler_name" in i and not info["params"].get("sampler"):
+                    info["params"]["sampler"] = i["sampler_name"]
+            elif "EmptyLatent" in ct:
+                # 只认**真正在用的**那条链的起点（可能有多段采样 + 放大）。
+                # 用前缀匹配：EmptySD3LatentImage / EmptyFluxLatentImage 等也算。
                 _nid, _mul = _true_latent_node(prompt)
                 if str(nid) == str(_nid or ""):
                     if "width" in i:
@@ -523,11 +563,19 @@ def _parse_sd_parameters(text):
         if l.startswith("Negative prompt:"):
             neg_idx = i
             break
+        if l.startswith("Negative:"):          # 简化变体
+            neg_idx = i
+            break
     if neg_idx is None:
         pos_lines = body
     else:
         pos_lines = body[:neg_idx]
-        neg = body[neg_idx][len("Negative prompt:"):].strip()
+        head = body[neg_idx]
+        for pre in ("Negative prompt:", "Negative:"):
+            if head.startswith(pre):
+                head = head[len(pre):]
+                break
+        neg = head.strip()
         for l in body[neg_idx + 1:]:
             if l.strip():
                 neg += " " + l.strip()
@@ -540,10 +588,24 @@ def _parse_sd_parameters(text):
             if ":" in part:
                 k, v = part.split(":", 1)
                 kv[k.strip().lower()] = v.strip()
+
+        def _num(key, cast):
+            """参数一律转成数字 —— 跟 ComfyUI 那边保持一致。
+            原来留着字符串，导致范围筛选/排序跟 ComfyUI 图片混在一起时行为不一。"""
+            raw = kv.get(key)
+            if raw is None or raw == "":
+                return None
+            try:
+                return cast(float(raw)) if cast is int else cast(float(raw))
+            except Exception:
+                return None
+
         info["model"] = kv.get("model", "")
         info["params"] = {
-            "seed": kv.get("seed"), "steps": kv.get("steps"),
-            "sampler": kv.get("sampler"), "cfg": kv.get("cfg scale"),
+            "seed": _num("seed", int),
+            "steps": _num("steps", int),
+            "sampler": kv.get("sampler") or None,
+            "cfg": _num("cfg scale", float),
             "width": None, "height": None,
         }
         m = re.search(r"(\d+)\s*[xX×]\s*(\d+)", kv.get("size", ""))
@@ -731,6 +793,36 @@ def _scan_directory_impl(source, root, parser, exts=IMAGE_EXTS):
     return new_entries
 
 
+_SAMPLER_CLASSES = ("KSampler", "KSamplerAdvanced", "SamplerCustom",
+                    "SamplerCustomAdvanced", "ClownsharKSampler_Beta",
+                    "KSamplerWithNoise", "KSamplerProgress", "SamplerEfficient",
+                    "KSampler //Inspire", "KSamplerAdvanced //Inspire")
+
+
+def _is_sampler_node(node):
+    """判断一个节点是不是"采样器"。
+
+    不能只认 KSampler —— 第三方采样节点（如 ClownsharKSampler_Beta）的
+    输入结构和 KSampler **一模一样**（positive/negative/latent_image/seed/steps/cfg），
+    只按类名匹配会让整条解析链（提示词/步数/尺寸/种子）全部失效。
+
+    这里按**结构**判断：有 latent_image，且有 positive/negative 或 guider。
+    """
+    if not isinstance(node, dict):
+        return False
+    ct = node.get("class_type", "")
+    if ct in _SAMPLER_CLASSES:
+        return True
+    ins = node.get("inputs", {}) or {}
+    if not isinstance(ins, dict):
+        return False
+    if "latent_image" in ins and ("positive" in ins or "negative" in ins):
+        return True
+    if "latent_image" in ins and "guider" in ins:      # SamplerCustomAdvanced 风格
+        return True
+    return False
+
+
 def _true_latent_node(prompt):
     """找出**真正决定成品尺寸**的 latent 链路终点。
 
@@ -782,7 +874,7 @@ def _true_latent_node(prompt):
     best = None      # (面积, 节点id, 倍数)
     # ① 遍历所有 KSampler，取"最终尺寸最大"的那条链
     for node in prompt.values():
-        if node.get("class_type") not in ("KSampler", "KSamplerAdvanced"):
+        if not _is_sampler_node(node):
             continue
         lat = (node.get("inputs") or {}).get("latent_image")
         if not (isinstance(lat, list) and len(lat) >= 1):

@@ -1,5 +1,83 @@
 # 更新日志
 
+## v1.3.9
+
+### 修复：换了采样节点就读不出提示词
+
+**根因**：解析链只认 `KSampler` / `KSamplerAdvanced` 这两个类名。
+
+可很多第三方采样节点的**输入结构和 KSampler 完全一样**
+（`positive` / `negative` / `latent_image` / `seed` / `steps` / `cfg` / `sampler_name`），
+只是名字不同 —— 比如 `ClownsharKSampler_Beta`。
+
+一旦工作流用了这类节点，会连锁失效：
+
+| 读不到 | 原因 |
+|---|---|
+| 提示词 | 没有 KSampler 可供回溯 positive/negative |
+| 步数 / CFG / 种子 / 采样器 | 同上 |
+| 尺寸 | 找不到 latent_image 的起点 |
+
+**改法**：采样器改成**按结构识别**，不再按类名硬匹配。
+
+```python
+def _is_sampler_node(node):
+    # 有 latent_image，且有 positive/negative（或 guider）→ 就是采样器
+```
+
+同时补了常见第三方采样器的类名白名单
+（`SamplerCustom` / `SamplerCustomAdvanced` / `ClownsharKSampler_Beta` …）。
+
+> 实测：`Anima_base1/Anima_00001_.png` 这类图，修复前提示词、步数、尺寸全是空，
+> 修复后全部读出（50 步 / cfg 5.0 / multistep-abnorsett_2m / beta）。
+
+### 增强：更通用的提示词提取
+
+- **文本键名扩充** —— 增加 `prompt_text` / `positive_prompt` / `text_g` / `text_l` /
+  `content` / `string` / `wildcard_text` 等 16 个常见键名
+- **不认识的自定义节点也能取到文本** —— 原来是"字符串长度 > 40 才当提示词"，
+  短提示词和 tag 串会被漏掉；现在按「有分隔符且不像文件名」判断
+- **现代采样链** —— Flux / SD3 常把采样拆成
+  `RandomNoise` + `KSamplerSelect` + `BasicScheduler` + `CFGGuider`，
+  现在能从中读出种子 / 步数 / 调度器 / 采样器 / CFG
+- **任意 EmptyLatent 节点** —— 原来只认 `EmptyLatentImage`，
+  现在 `EmptySD3LatentImage` / `EmptyFluxLatentImage` 等都算
+
+### 修复：SD WebUI 参数类型不一致
+
+`steps` / `cfg` / `seed` 之前存的是**字符串**（`"30"`），ComfyUI 那边是数字。
+两者混在一起做范围筛选和排序时行为不一致。现在统一转成数字。
+
+顺带支持 `Negative:` 这种简写前缀（原来只认 `Negative prompt:`）。
+
+### 验证
+
+用 6 种工作流合成 PNG 跑单元测试，**33/33 全部通过**：
+
+| 用例 | 覆盖 |
+|---|---|
+| A | ComfyUI 官方默认工作流（CLIPTextEncode + KSampler） |
+| B | Flux / SD3 风格（EmptySD3LatentImage + UNETLoader） |
+| C | 两段采样 + LatentUpscaleBy（尺寸要乘放大倍数） |
+| D | SD WebUI parameters 字符串 |
+| E | 任意自定义节点（文本藏在 `prompt_text` 这类非标准键） |
+| F | 现代采样链（RandomNoise + BasicScheduler + CFGGuider） |
+
+再抽真实图库 **300 张**实测：
+
+```
+正向提示词  300/300  (100.0%)
+负向提示词  294/300  (98.0%)   ← 6 张本来就无负向
+步数        300/300  (100.0%)
+尺寸        300/300  (100.0%)
+采样器      300/300  (100.0%)
+模型        300/300  (100.0%)
+```
+
+识别到的采样器类型：`KSampler` ×339、`KSamplerAdvanced` ×4、`ClownsharKSampler_Beta` ×1。
+
+---
+
 ## v1.3.8
 
 ### 修复：固定阈值方向反了、量程也不够用
