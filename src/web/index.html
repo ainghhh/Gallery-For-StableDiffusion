@@ -2814,7 +2814,7 @@ async function fsShowDrives(){
   const last = localStorage.getItem("gallery4comfyui-lastdir") || "";
   if(last){
     try{
-      const r = await api("/api/fs/list?path=" + encodeURIComponent(last));
+      const r = await api("/api/fs/list?path=" + encodeURIComponent(last) + "&scope=any");
       if(!r.error){ fsEnter(last); return; }
     }catch(e){}
   }
@@ -2829,7 +2829,7 @@ async function fsShowDrives(){
   });
 }
 async function fsEnter(path){
-  const r = await api("/api/fs/list?path=" + encodeURIComponent(path));
+  const r = await api("/api/fs/list?path=" + encodeURIComponent(path) + "&scope=any");
   if(r.error){ alert(r.error); return; }
   FS_PATH = r.path;
   try{ localStorage.setItem("gallery4comfyui-lastdir", r.path); }catch(e){}
@@ -2846,7 +2846,7 @@ async function fsEnter(path){
 $("btnBrowse").onclick = ()=>{ $("fsPicker").classList.add("show"); fsShowDrives(); };
 $("fsUp").onclick = async ()=>{
   if(!FS_PATH) return;
-  const parent = (await api("/api/fs/list?path=" + encodeURIComponent(FS_PATH))).parent;
+  const parent = (await api("/api/fs/list?path=" + encodeURIComponent(FS_PATH) + "&scope=any")).parent;
   if(parent) fsEnter(parent);
   else fsShowDrives();
 };

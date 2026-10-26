@@ -63,6 +63,39 @@
   .done .big { font-size:44px; margin-bottom:14px; }
   .done h2 { font-size:18px; margin:0 0 10px; }
   .done p { color:var(--dim); font-size:13px; line-height:1.8; margin:0; }
+
+  /* 内嵌文件夹浏览器 */
+  .picker{position:fixed; inset:0; background:rgba(0,0,0,.55); display:none;
+          align-items:center; justify-content:center; z-index:50}
+  .picker.show{display:flex}
+  .pbox{width:min(680px,92vw); max-height:80vh; background:var(--panel);
+        border:1px solid var(--line); border-radius:14px; display:flex; flex-direction:column;
+        box-shadow:0 24px 60px rgba(0,0,0,.5); overflow:hidden}
+  .phead{display:flex; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line)}
+  .phead b{font-size:15px}
+  .pclose{margin-left:auto; background:none; border:none; color:var(--dim);
+          font-size:16px; cursor:pointer; padding:4px 8px; border-radius:6px}
+  .pclose:hover{background:var(--bg); color:var(--fg)}
+  .pbar{display:flex; align-items:center; gap:8px; padding:10px 16px; border-bottom:1px solid var(--line)}
+  .pbtn{background:var(--bg); border:1px solid var(--line); color:var(--fg);
+        border-radius:7px; padding:5px 10px; font-size:12px; cursor:pointer; font-family:inherit}
+  .pbtn:hover{border-color:var(--accent); color:var(--accent)}
+  .ppath{font-size:12px; color:var(--dim); overflow:hidden; text-overflow:ellipsis;
+         white-space:nowrap; margin-left:auto; max-width:340px}
+  .plist{flex:1; overflow:auto; padding:6px 8px; min-height:220px}
+  .prow{display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:7px;
+        cursor:pointer; font-size:13px}
+  .prow:hover{background:var(--bg)}
+  .prow .tag{font-size:10px; background:var(--accent); color:#fff;
+             padding:1px 6px; border-radius:4px}
+  .plist::-webkit-scrollbar{width:10px}
+  .plist::-webkit-scrollbar-track{background:transparent}
+  .plist::-webkit-scrollbar-thumb{background:#3a4048; border-radius:6px; border:2px solid var(--panel)}
+  .plist::-webkit-scrollbar-thumb:hover{background:#4a515b}
+  .pfoot{display:flex; align-items:center; gap:10px; padding:12px 16px; border-top:1px solid var(--line)}
+  .pcur{font-size:12px; color:var(--dim); overflow:hidden; text-overflow:ellipsis;
+        white-space:nowrap; flex:1}
+  .go.small{padding:8px 16px; font-size:13px; width:auto; flex:0 0 auto}
 </style>
 </head>
 <body>
@@ -113,6 +146,31 @@
 
 </div>
 
+<!-- ------------------------------------------------------------------
+     内嵌文件夹浏览器
+     为什么不用系统原生对话框：pywebview 6 在 Windows 下，从 js_api 的
+     后台线程调 create_file_dialog 会卡住（对话框不出现、Promise 永不返回），
+     表现就是「点浏览没反应」。这里改成纯 HTML + HTTP，一定能用。
+     ------------------------------------------------------------------ -->
+<div class="picker" id="picker">
+  <div class="pbox">
+    <div class="phead">
+      <b>选择文件夹</b>
+      <button class="pclose" id="pClose">✕</button>
+    </div>
+    <div class="pbar">
+      <button class="pbtn" id="pUp">↑ 上级</button>
+      <button class="pbtn" id="pNew">＋ 新建文件夹</button>
+      <span class="ppath" id="pPath">选择盘符</span>
+    </div>
+    <div class="plist" id="pList"></div>
+    <div class="pfoot">
+      <span class="pcur" id="pCur"></span>
+      <button class="go small" id="pPick">选择此目录</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let CFG = {};
@@ -135,19 +193,105 @@ async function api(name, ...args) {
 window.setPath = (w, v) => { const e = $(w); if (e) { e.value = v; e.classList.remove("bad"); } };
 
 // ---------- 浏览目录 ----------
-document.querySelectorAll(".pick").forEach(b => {
-  b.addEventListener("click", async () => {
-    const w = b.dataset.pick;
-    const cur = $(w).value.trim();
-    if (bridged() && window.pywebview.api.pick_dir) {
-      const v = await window.pywebview.api.pick_dir(cur);
-      if (v) window.setPath(w, v);
-    } else {
-      // 浏览器调试：手动输入
-      const v = prompt("目录路径：", cur);
-      if (v) window.setPath(w, v);
-    }
+// ⚠️ 这里原来调 window.pywebview.api.pick_dir（原生对话框）。
+//    实测在 pywebview 6 + Windows 下，从 js_api 的后台线程调
+//    create_file_dialog 会卡死：对话框不出现、Promise 永不返回，
+//    表现就是「点浏览没反应」。
+//    现在改成内嵌的 HTML 文件夹浏览器（纯 HTTP），一定能用。
+let PICK_TARGET = "";
+let PICK_PATH = "";
+
+async function fsDrives() {
+  const r = await fetch("/gallery4comfyui/api/fs/drives").then(x => x.json()).catch(() => ({}));
+  renderList("选择盘符", (r.drives || []).map(d => ({ name: d, path: d })), null);
+}
+
+async function fsEnter(path) {
+  const r = await fetch("/gallery4comfyui/api/fs/list?path=" +
+    encodeURIComponent(path) + "&scope=any").then(x => x.json()).catch(() => ({}));
+  if (r.error) { alert(r.error); return; }
+  PICK_PATH = r.path;
+  $("pPath").textContent = r.path;
+  $("pCur").textContent = r.path;
+  renderList(r.path, (r.dirs || []).map(d => ({
+    name: d.name,
+    path: r.path.replace(/\\+$/, "") + "\\" + d.name,
+    hasOutputs: d.has_outputs,
+    hasModels: d.has_models,
+  })), r.parent);
+}
+
+function renderList(title, items, parent) {
+  const box = $("pList");
+  box.innerHTML = "";
+  if (parent) {
+    const up = document.createElement("div");
+    up.className = "prow";
+    up.innerHTML = '<span>⬆</span><span>.. 上级目录</span>';
+    up.onclick = () => fsEnter(parent);
+    box.appendChild(up);
+  }
+  if (!items.length) {
+    box.innerHTML = '<div class="prow" style="color:var(--dim)">（空）</div>';
+    return;
+  }
+  items.forEach(it => {
+    const row = document.createElement("div");
+    row.className = "prow";
+    let tag = "";
+    if (it.hasOutputs) tag = '<span class="tag">含 outputs</span>';
+    else if (it.hasModels) tag = '<span class="tag">含 models</span>';
+    row.innerHTML = "<span>📁</span><span style='flex:1;overflow:hidden;" +
+      "text-overflow:ellipsis;white-space:nowrap'>" + it.name + "</span>" + tag;
+    row.onclick = () => fsEnter(it.path);
+    box.appendChild(row);
   });
+}
+
+function openPicker(target) {
+  PICK_TARGET = target;
+  PICK_PATH = "";
+  $("picker").classList.add("show");
+  $("pPath").textContent = "选择盘符";
+  $("pCur").textContent = "";
+  // 有当前值就从那儿开始
+  const cur = $(target).value.trim();
+  if (cur) {
+    fsEnter(cur).catch(() => fsDrives());
+  } else {
+    fsDrives();
+  }
+}
+
+document.querySelectorAll(".pick").forEach(b => {
+  b.addEventListener("click", () => openPicker(b.dataset.pick));
+});
+
+$("pClose").onclick = () => $("picker").classList.remove("show");
+$("pUp").onclick = async () => {
+  if (!PICK_PATH) return fsDrives();
+  const r = await fetch("/gallery4comfyui/api/fs/list?path=" +
+    encodeURIComponent(PICK_PATH) + "&scope=any").then(x => x.json()).catch(() => ({}));
+  if (r.parent) fsEnter(r.parent); else fsDrives();
+};
+$("pNew").onclick = async () => {
+  if (!PICK_PATH) { alert("请先进入一个目录"); return; }
+  const name = prompt("新建文件夹名称：");
+  if (!name || !name.trim()) return;
+  await fetch("/gallery4comfyui/api/fs/mkdir", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: PICK_PATH, name: name.trim() }),
+  });
+  fsEnter(PICK_PATH);
+};
+$("pPick").onclick = () => {
+  if (!PICK_PATH) { alert("请先选一个目录"); return; }
+  window.setPath(PICK_TARGET, PICK_PATH);
+  $("picker").classList.remove("show");
+  if (PICK_TARGET) check(PICK_TARGET);
+};
+$("picker").addEventListener("click", e => {
+  if (e.target.id === "picker") $("picker").classList.remove("show");
 });
 
 // ---------- 校验 ----------

@@ -10,6 +10,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -972,33 +973,34 @@ def build_app():
         return _json({"drives": out})
 
     async def api_fs_list(request):
-        """列目录：给前端「选择文件夹」用。只允许列已配置根目录下的路径。"""
+        """列目录：给前端「选择文件夹」用。
+
+        权限策略：
+          scope=any  → 允许浏览任意路径（设置页选目录 / 打包选输出位置）
+          默认       → 只允许已配置的图片根目录（图库内的「打开文件夹」）
+
+        ⚠️ 这里踩了两个坑，都让「选目录」彻底不可用：
+          1) 一律限制在图片根目录内 → 设置页选 ComfyUI 目录、打包选输出目录都被判「越权」
+          2) 自己手写 dirs 返回的是**字符串数组**，而前端按对象用（d.name / d.has_outputs）
+             → 即使不越权，目录列表也是空的、名字还显示 undefined
+        现在统一交给 gallery_core.list_dir()，它返回的结构就是前端要的
+        （带 has_outputs / has_models 标记，方便用户认出 WebUI 根目录）。
+        """
         p = (request.query.get("path") or "").strip()
+        scope = (request.query.get("scope") or "").strip().lower()
         if not p:
-            return _json({"path": "", "dirs": [], "files": []})
+            return _json({"path": "", "parent": None, "dirs": []})
         if not os.path.isdir(p):
-            return _json({"error": "目录不存在", "path": p, "dirs": [], "files": []})
-        roots = _roots()
-        try:
-            real = os.path.realpath(p)
-            if roots and not any(real == r or real.startswith(r + os.sep) for r in roots):
-                return _json({"error": "越权访问", "path": p, "dirs": [], "files": []})
-        except Exception:
-            return _json({"error": "越权访问", "path": p, "dirs": [], "files": []})
-        dirs, files = [], []
-        try:
-            for e in sorted(os.scandir(p), key=lambda x: x.name.lower()):
-                try:
-                    if e.is_dir():
-                        dirs.append(e.name)
-                    elif e.is_file():
-                        files.append(e.name)
-                except OSError:
-                    continue
-        except Exception as e:
-            return _json({"error": str(e), "path": p, "dirs": [], "files": []})
-        return _json({"path": p, "parent": os.path.dirname(p.rstrip("\\/")),
-                      "dirs": dirs, "files": files[:2000]})
+            return _json({"error": "目录不存在", "path": p, "parent": None, "dirs": []})
+        if scope != "any":
+            roots = _roots()
+            try:
+                real = os.path.realpath(p)
+                if roots and not any(real == r or real.startswith(r + os.sep) for r in roots):
+                    return _json({"error": "越权访问", "path": p, "parent": None, "dirs": []})
+            except Exception:
+                return _json({"error": "越权访问", "path": p, "parent": None, "dirs": []})
+        return _json(G.list_dir(p))
 
     async def api_fs_mkdir(request):
         try:
@@ -1006,8 +1008,19 @@ def build_app():
         except Exception:
             data = {}
         p = (data.get("path") or "").strip()
+        name = (data.get("name") or "").strip()
         if not p:
             return _json({"ok": False, "error": "缺路径"})
+        # 前端传的是 {path: 当前目录, name: 新文件夹名} —— 必须拼起来。
+        # 原来只 makedirs(path)，把"新建文件夹"变成了对当前目录的空操作，
+        # 返回还是 ok:true，用户看着成功其实什么都没建。
+        if name:
+            name = name.replace("\\", "/").split("/")[-1].strip()
+            if not name:
+                return _json({"ok": False, "error": "名称无效"})
+            p = os.path.join(p, name)
+        if not os.path.isdir(os.path.dirname(p) or "."):
+            return _json({"ok": False, "error": "父目录不存在"})
         try:
             os.makedirs(p, exist_ok=True)
             return _json({"ok": True, "path": p})
@@ -1015,33 +1028,157 @@ def build_app():
             return _json({"ok": False, "error": str(e)})
 
     async def api_fs_open_dir(request):
-        """用系统资源管理器打开输出目录。"""
-        import subprocess
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        rel = (data.get("file") or "").strip()
-        src = data.get("source") or "comfyui"
-        root = {"comfyui": (_cfg.get("comfy_output") or "").strip(),
-                "webui": (_cfg.get("webui_root") or "").strip()}.get(src, "")
-        target = root
-        if rel and root:
-            cand = os.path.join(root, os.path.dirname(rel.replace("/", os.sep)))
-            if os.path.isdir(cand):
-                target = cand
+        """用系统资源管理器打开目录。
+
+        同时支持两种调用方式：
+          · GET  /api/fs/open-dir?path=<绝对目录>      ← 前端实际用的是这个
+          · POST  {"file": "...", "source": "comfyui"}  ← 从图条目反推目录
+
+        ⚠️ 原来只做成 POST+JSON，而前端（灯箱「所在位置」、打包完成后自动打开）
+        用的是 GET+?path= —— 所以这个功能一直是坏的（404/405）。
+        """
+        q = request.query
+        rel = (q.get("file") or "").strip()
+        src = q.get("source") or "comfyui"
+        abs_path = (q.get("path") or "").strip()
+
+        if not abs_path and request.method == "POST":
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            rel = (data.get("file") or rel).strip()
+            src = data.get("source") or src
+            abs_path = (data.get("path") or "").strip()
+
+        if abs_path:
+            target = abs_path
+        else:
+            root = {"comfyui": (_cfg.get("comfy_output") or "").strip(),
+                    "webui": (_cfg.get("webui_root") or "").strip()}.get(src, "")
+            target = root
+            if rel and root:
+                cand = os.path.join(root, os.path.dirname(rel.replace("/", os.sep)))
+                if os.path.isdir(cand):
+                    target = cand
+
         if not target or not os.path.isdir(target):
             return _json({"ok": False, "error": "目录不存在"})
         try:
-            os.startfile(target)          # noqa: S606 —— 只打开自己的输出目录
+            os.startfile(target)          # noqa: S606 —— 只打开用户自己选的目录
             return _json({"ok": True, "path": target})
         except Exception as e:
             return _json({"ok": False, "error": str(e)})
+
+    # ---- 打包导出（独立版原先缺失，前端调 /api/zip 一直 404）----
+    def _pack_images(data):
+        """收集文件 + 写 zip。在后台线程跑，不阻塞服务。
+
+        body: {target, items}          → 打包选中的图
+              {target, query}          → 打包筛选结果全部
+              by_model: true           → 按大模型分子目录
+              name: "xxx"              → 指定 zip 名（默认带时间戳）
+        """
+        import zipfile
+        import datetime as _dt
+
+        target = (data.get("target") or "").strip()
+        if not target or not os.path.isdir(target):
+            return {"error": "目标目录不存在（先在弹窗里选一个文件夹）", "_code": 400}
+        by_model = bool(data.get("by_model", False))
+        entries = []          # (磁盘路径, 子目录)
+        n_candidates = 0
+
+        if data.get("items"):
+            for it in data["items"]:
+                fp = G.image_path(it.get("source", "comfyui"),
+                                  _safe_name_(it.get("file", "")))
+                if fp:
+                    entries.append((fp, ""))
+        elif data.get("query"):
+            q = data["query"]
+            src = q.get("source", "comfyui")
+            # 索引还没建好就打包 → query 拿不到数据，会变成 500 或"没有可打包的图片"。
+            # 给个明确提示，别让用户看着报错猜。
+            try:
+                st = G.scan_status(src)
+                if st.get("total") and not st.get("ready"):
+                    return {"error": "索引还在构建中（%s/%s），等它扫完再打包"
+                                     % (st.get("scanned", 0), st.get("total", 0)),
+                            "_code": 409}
+            except Exception:
+                pass
+            try:
+                r = G.query(
+                    src,
+                    q=q.get("q", ""), model=q.get("model", ""),
+                    sampler=q.get("sampler", ""), lora=q.get("lora", ""),
+                    steps_min=_int(q.get("steps_min")), steps_max=_int(q.get("steps_max")),
+                    cfg_min=_float(q.get("cfg_min")), cfg_max=_float(q.get("cfg_max")),
+                    min_w=_int(q.get("min_w")), min_h=_int(q.get("min_h")),
+                    fav_only=q.get("fav", "0") == "1", tags=q.get("tags", ""),
+                    sort="newest", page=1, page_size=10000,
+                )
+            except Exception as e:
+                return {"error": "查询图片失败：%s" % e, "_code": 500}
+            n_candidates = len(r.get("items", []))
+            for it in r.get("items", []):
+                fp = G.image_path(src, _safe_name_(it.get("file", "")))
+                if fp:
+                    sub = str(it.get("model") or "未分类") if by_model else ""
+                    entries.append((fp, sub))
+        else:
+            return {"error": "没有指定要打包的图片", "_code": 400}
+
+        if not entries:
+            msg = "没有可打包的图片"
+            if n_candidates:
+                msg += "（候选 %d 个，但磁盘上都找不到文件）" % n_candidates
+            return {"error": msg, "_code": 400}
+
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        zname = (data.get("name") or "").strip()
+        if zname:
+            safe_n = re.sub(r'[\\/:*?"<>|]', "_", zname).strip() or "gallery_export"
+            zpath = os.path.join(target, safe_n + ".zip")
+            if os.path.exists(zpath):
+                zpath = os.path.join(target, "%s_%s.zip" % (safe_n, ts))
+        else:
+            zpath = os.path.join(target, "gallery_export_%s.zip" % ts)
+
+        try:
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+                seen = set()
+                for fp, sub in entries:
+                    name = os.path.basename(fp)
+                    if name in seen:                 # 不同目录下同名文件，加序号避免覆盖
+                        name = "%d_%s" % (len(seen), name)
+                    seen.add(name)
+                    if sub:
+                        safe = re.sub(r'[\\/:*?"<>|]', "_", sub).strip() or "未分类"
+                        z.write(fp, os.path.join(safe, name))
+                    else:
+                        z.write(fp, name)
+            return {"ok": True, "zip": zpath, "count": len(entries), "_code": 200}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "_code": 500}
+
+    async def api_zip(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _json({"error": "bad json"}, status=400)
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(None, _pack_images, data)
+        code = resp.pop("_code", 200)
+        return _json(resp, status=code)
 
     app.router.add_get(P + "/api/fs/drives", api_fs_drives)
     app.router.add_get(P + "/api/fs/list", api_fs_list)
     app.router.add_post(P + "/api/fs/mkdir", api_fs_mkdir)
     app.router.add_post(P + "/api/fs/open-dir", api_fs_open_dir)
+    app.router.add_get(P + "/api/fs/open-dir", api_fs_open_dir)
+    app.router.add_post(P + "/api/zip", api_zip)
 
     # ---- 本软件特有：设置读写（改的就是自己的 config.json）----
     async def api_settings(request):
