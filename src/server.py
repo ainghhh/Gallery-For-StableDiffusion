@@ -601,13 +601,31 @@ async def api_audio_sensitivity(request):
         v = int(request.query.get("value") or 5)
     except Exception:
         v = 5
-    _AB.ENGINE.sensitivity = max(1, min(50, v))
+    _AB.ENGINE.sensitivity = max(_AB.SENS_MIN, min(_AB.SENS_MAX, v))
     # 顺便支持在同一个接口上切换阈值模式
     m = (request.query.get("mode") or "").strip().lower()
     if m in ("dynamic", "fixed"):
         _AB.ENGINE.thr_mode = m
     return _json({"ok": True, "sensitivity": _AB.ENGINE.sensitivity,
                   "thr_mode": _AB.ENGINE.thr_mode})
+
+
+async def api_audio_fixed_db(request):
+    """固定模式的门槛（绝对 dB）。数值越大 = 门槛越高 = 越难触发。"""
+    if _AB is None:
+        return _json({"ok": False})
+    raw = request.query.get("value")
+    if raw is None:
+        return _json({"ok": True, "fixed_db": round(_AB.ENGINE.fixed_db, 1),
+                      "range": [_AB.FIXED_DB_MIN, _AB.FIXED_DB_MAX]})
+    try:
+        v = float(raw)
+    except Exception:
+        return _json({"ok": False, "error": "value 需要是数字（dB）"})
+    v = max(_AB.FIXED_DB_MIN, min(_AB.FIXED_DB_MAX, v))
+    _AB.ENGINE.fixed_db = v
+    return _json({"ok": True, "fixed_db": round(v, 1),
+                  "range": [_AB.FIXED_DB_MIN, _AB.FIXED_DB_MAX]})
 
 
 async def api_audio_thr_mode(request):
@@ -707,6 +725,9 @@ def build_app():
     app.router.add_post(P + "/api/audio/stop", api_audio_stop)
     app.router.add_get(P + "/api/audio/status", api_audio_status)
     app.router.add_post(P + "/api/audio/sensitivity", api_audio_sensitivity)
+    app.router.add_get(P + "/api/audio/sensitivity", api_audio_sensitivity)
+    app.router.add_post(P + "/api/audio/fixed-db", api_audio_fixed_db)
+    app.router.add_get(P + "/api/audio/fixed-db", api_audio_fixed_db)
     app.router.add_post(P + "/api/audio/thr-mode", api_audio_thr_mode)
     app.router.add_get(P + "/api/audio/stream", api_audio_stream)
 

@@ -23,6 +23,7 @@
     fps: parseFloat(localStorage.getItem("slide.fps") || "8"),
     spf: parseFloat(localStorage.getItem("slide.spf") || "1"),
     aSens: parseInt(localStorage.getItem("slide.aSens") || "5", 10),
+    aFixedDb: parseFloat(localStorage.getItem("slide.aFixedDb") || "-30"),
     thrMode: localStorage.getItem("slide.thrMode") || "dynamic",   // dynamic | fixed
     rMode: localStorage.getItem("slide.rMode") || "mean",     // mean | real | approx
     threshold: parseInt(localStorage.getItem("slide.thr") || "3", 10),
@@ -395,6 +396,7 @@
   // 转场时长按"上一拍到现在"的间隔动态给，快拍时动画自动变短。
   let lastBeatAt = 0;
   audio.onBeat = (t) => {
+    pulseBeat();
     if (!S.playing) return;
     const gap = lastBeatAt ? (t - lastBeatAt) : 420;
     lastBeatAt = t;
@@ -693,18 +695,69 @@
     document.querySelectorAll("#thrMode button").forEach(b =>
       b.classList.toggle("on", b.dataset.mode === m));
     const fixed = m === "fixed";
-    // 两种模式的滑块含义不同：动态是"比基线高多少"，固定是"绝对门槛"
-    $("aSensLabel").textContent = fixed ? "门槛" : "灵敏度";
-    $("aSens").title = fixed
-      ? "固定阈值：绝对 dB 门槛。往右 = 更低的门槛（更灵敏）"
-      : "动态阈值：比当前基线高多少 dB 才算一拍。往右 = 更灵敏";
+    const sl = $("aSens");
+
+    // 两种模式的滑块含义完全不同，所以连量程一起换：
+    //   动态：1..50 灵敏度（往右更灵敏）
+    //   固定：-60..-3 dB 绝对门槛（往右门槛更高 = 更严）
+    if (fixed) {
+      $("aSensLabel").textContent = "门槛";
+      sl.min = "-60"; sl.max = "-3"; sl.step = "0.5";
+      sl.value = String(S.aFixedDb);
+      $("aSensVal").textContent = fmtDb(S.aFixedDb);
+      sl.title = "固定阈值：绝对 dB 门槛。往右 = 门槛更高 = 只有更响的拍子才切";
+    } else {
+      $("aSensLabel").textContent = "灵敏度";
+      sl.min = "1"; sl.max = "50"; sl.step = "1";
+      sl.value = String(S.aSens);
+      $("aSensVal").textContent = String(S.aSens);
+      sl.title = "动态阈值：比当前基线高多少 dB 才算一拍。往右 = 更灵敏";
+    }
     const mt = document.querySelector(".meter");
     if (mt) mt.classList.toggle("fixed", fixed);
+    syncSliderFill();
+  }
+
+  function fmtDb(v) { return (v > 0 ? "+" : "") + Number(v).toFixed(1); }
+
+  /** 滑块已填充部分的比例（给 CSS 的 --fill 用，做出"进度条"手感）。 */
+  function syncSliderFill() {
+    const sl = $("aSens");
+    if (!sl) return;
+    const mn = parseFloat(sl.min), mx = parseFloat(sl.max);
+    const v = parseFloat(sl.value);
+    const pct = (mx > mn) ? ((v - mn) / (mx - mn)) * 100 : 0;
+    sl.style.setProperty("--fill", Math.max(0, Math.min(100, pct)).toFixed(1) + "%");
+  }
+
+  /** 一拍点亮：整条播放条轻微呼吸 + 电平表发光。 */
+  let _beatT1 = 0, _beatT2 = 0, _barEl = null;
+  function pulseBeat() {
+    if (!_barEl) _barEl = $("bar");
+    const mt = document.querySelector(".meter");
+    const now = performance.now();
+    // 太密时不重复触发（44ms ≈ 22拍/秒以上的极快节奏就只保一次）
+    if (now - _beatT1 < 44) return;
+    _beatT1 = now;
+    if (_barEl) {
+      _barEl.classList.remove("beat");
+      void _barEl.offsetWidth;        // 强制重排，让动画能连续重放
+      _barEl.classList.add("beat");
+    }
+    if (mt) {
+      mt.classList.remove("beat");
+      void mt.offsetWidth;
+      mt.classList.add("beat");
+      clearTimeout(_beatT2);
+      _beatT2 = setTimeout(() => mt.classList.remove("beat"), 160);
+    }
   }
 
   // 启动时把上次保存的阈值模式同步给后端（否则后端一直用默认 dynamic）
   (async () => {
     try { await audio.setThrMode(S.thrMode || "dynamic"); } catch (e) {}
+    try { await audio.setFixedDb(S.aFixedDb); } catch (e) {}
+    try { await audio.setSensitivity(S.aSens); } catch (e) {}
   })();
 
   // ⚠️ 这里原来有个「① 授权音频」按钮，会在页面里调 getUserMedia。
@@ -712,10 +765,20 @@
   //    所以整个权限流程已删除 —— 采集搬到 Python 侧（WASAPI 回环），
   //    前端一个音频 API 都不碰，也就不会再崩、不会弹麦克风权限。
   $("aSens").oninput = () => {
+    if ((S.thrMode || "dynamic") === "fixed") {
+      const v = Math.max(-60, Math.min(-3, parseFloat($("aSens").value)));
+      if (!isFinite(v)) return;
+      S.aFixedDb = v; save("aFixedDb", v);
+      audio.setFixedDb(v);
+      $("aSensVal").textContent = fmtDb(v);
+      syncSliderFill();
+      return;
+    }
     const v = Math.max(1, Math.min(50, parseInt($("aSens").value || "5", 10)));
     S.aSens = v; save("aSens", v);
     audio.setSensitivity(v);          // 通知后端调整判定阈值
     $("aSensVal").textContent = v;
+    syncSliderFill();
   };
   document.querySelectorAll("#rMode button").forEach(b => {
     b.onclick = () => {

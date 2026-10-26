@@ -63,14 +63,31 @@ SENS_MAX = 50
 SENS_NEED_DB_LO = 9.0     # 灵敏度 1：要高出 9dB 才算一拍（很挑）
 SENS_NEED_DB_HI = 1.2     # 灵敏度 50：高出 1.2dB 就触发（极灵敏）
 
-# 固定阈值模式的绝对门槛（dB）。
-# 灵敏度 1 → -6dB（要很响才切）；灵敏度 50 → -24dB（轻一点也能切）。
+# ── 固定阈值模式：滑块直接就是"绝对 dB 门槛" ───────────────────────────
 #
-# ⚠️ 下限不能设太低：门槛一旦低过底噪（典型数字音源约 -34dB），
-# 判定就"永远为真"，只会触发一次然后被 _armed 挡住（实测档 50 就是这样，0 拍）。
-# -24dB 既留了余量，又仍能抓弱拍的鼓点。
-FIXED_DB_HI = -6.0
-FIXED_DB_LO = -24.0
+# 以前是用灵敏度 1..50 反推门槛（1→-6dB，50→-24dB），两个毛病：
+#   ① 滑块往右（更灵敏）门槛数值反而变小，看着像"越调越高"，反直觉
+#   ② 最灵敏一档也才 -24dB，用户实测还是嫌高、切不动
+# 现在滑块直接控门槛，**数值越大 = 门槛越高 = 越难触发**，并且把整个可用区间铺满：
+#
+#   -60 dB ──────────────────────────────  -3 dB
+#   极灵敏（几乎有声音就切）        很严（只切接近满刻度的重拍）
+#
+# 为什么下限取 -60：典型数字音源底噪约 -34 dB 上下，安静段 -50 dB 左右。
+# 给到 -60 就足够"任何有声段都触发"，同时不至于低到连静音都算（静音 rms≈1e-9
+# 会算成 -180dB，仍然低于 -60，不会误触发）。
+# 上限 -3：接近满刻度的重拍才过，用于只切最强拍。
+FIXED_DB_MIN = -60.0
+FIXED_DB_MAX = -3.0
+FIXED_DB_DEFAULT = -30.0
+
+# 固定模式下，当电平**持续**高于门槛时（门槛调得很低就会这样），
+# 光靠"兜底放行"会变成固定节奏的节拍器（跟音乐无关）。
+# 所以额外要求这一下得有"上升沿"：相对 100ms 前至少涨这么多 dB 才算一拍。
+# 鼓点、军鼓这类打击音都能满足；持续的长音/铺底则不触发 —— 这符合听感。
+FIXED_RISE_DB = 1.5
+RISE_LOOKBACK_MS = 100.0
+_RISE_HIST_MS = 400.0
 
 
 # 一阶低通的系数（在 48kHz 下逼近 150Hz 截止）
@@ -91,6 +108,7 @@ class BeatEngine(object):
         self.error = ""
         self.sensitivity = 5
         self.thr_mode = "dynamic"   # "dynamic"（跟随基线）| "fixed"（绝对 dB）
+        self.fixed_db = FIXED_DB_DEFAULT   # 固定模式下的绝对门槛（dB）
         self.gain_db = 0.0
 
         # 判定状态
@@ -99,6 +117,7 @@ class BeatEngine(object):
         self._last_beat = 0.0
         self._armed = True        # 只有"掉下阈值过"才允许下一次触发
         self._beats = []
+        self._hist = []           # [(t_ms, db)] 最近 400ms，用来判"有没有上升沿"
 
         # 电平（给 UI）
         self.level = 0.0
@@ -139,6 +158,8 @@ class BeatEngine(object):
             "error": self.error,
             "sensitivity": self.sensitivity,
             "thr_mode": self.thr_mode,
+            "fixed_db": round(self.fixed_db, 1),
+            "fixed_range": [FIXED_DB_MIN, FIXED_DB_MAX],
             "bpm": self.bpm(),
             "backends": {
                 "soundcard": _HAS_SOUNDCARD,
@@ -181,6 +202,9 @@ class BeatEngine(object):
             self._baseline_db = None
             self._armed = True
             self._beats = []
+            self._hist = []
+            self._last_beat = 0.0
+            self._last_judge = 0.0
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
         # 等它真正起来（最多 3 秒）
@@ -309,6 +333,22 @@ class BeatEngine(object):
             self.running = False
 
     # ---------------- 判定 ----------------
+    def _rise_db(self, now_ms):
+        """相对 RISE_LOOKBACK_MS 前涨了多少 dB（没有历史就返回 0）。"""
+        if not self._hist:
+            return 0.0
+        cur = self._hist[-1][1]
+        target = now_ms - RISE_LOOKBACK_MS
+        past = None
+        for t, v in self._hist:
+            if t <= target:
+                past = v
+            else:
+                break
+        if past is None:
+            past = self._hist[0][1]
+        return cur - past
+
     def _judge(self, rms, now_ms):
         rms = max(rms, 1e-9)
         db = 20.0 * math.log10(rms)
@@ -330,15 +370,20 @@ class BeatEngine(object):
         self.level_db = db
         self.level = max(0.0, min(1.0, (db + 60.0) / 60.0))
 
+        # 记一小段历史（用于判断"上升沿"）
+        # 时间轴一旦回退（重新开始听音会从 0 重新计时），旧的采样必须丢掉，
+        # 否则 _rise_db 会拿上一轮的数据算差值，导致门槛再低也不触发。
+        if self._hist and self._hist[-1][0] > now_ms:
+            self._hist = []
+        self._hist.append((now_ms, db))
+        while self._hist and (now_ms - self._hist[0][0]) > _RISE_HIST_MS:
+            self._hist.pop(0)
+
         # ── 阈值：动态 / 固定 ──
         if self.thr_mode == "fixed":
-            # 固定：直接用绝对 dB 门槛，不跟着音乐起伏走。
-            # 好处是"安静段落也照样按同一个标准切"，坏处是音量一变就得重调。
-            # need 在固定模式下代表"绝对阈值(dB)"，用同一个滑块控制。
-            s = max(SENS_MIN, min(SENS_MAX, self.sensitivity))
-            t = (s - SENS_MIN) / float(SENS_MAX - SENS_MIN)
-            # 灵敏度 1 → -6dB（几乎不切），50 → -48dB（很灵敏）
-            self.thresh_db = FIXED_DB_HI + (FIXED_DB_LO - FIXED_DB_HI) * t
+            # 固定：直接用滑块给出的绝对 dB 门槛。
+            # 滑块数值越大 = 门槛越高 = 越难触发（方向与用户直觉一致）。
+            self.thresh_db = max(FIXED_DB_MIN, min(FIXED_DB_MAX, self.fixed_db))
             self.gain_db = db - self.thresh_db
         else:
             # 动态（默认）：阈值 = 基线 + need，跟着音乐自己的动态范围走。
@@ -374,11 +419,23 @@ class BeatEngine(object):
             # _armed 语义：只有在"掉回阈值以下"时才会被重新置为 True，
             # 触发时要把它置 False（表示这一拍已经用掉了）。
             #
-            # 兜底：固定阈值模式下，若整段音频都高于门槛（音量偏大时很常见），
-            # armed 永远回不来 → 只切一次就卡死。
-            # 所以"高于门槛持续太久"时按 MIN_GAP_MS 强制放行一拍，
-            # 让它退回"按间隔切"，而不是彻底不动。
-            if (not self._armed) and (now_ms - self._last_beat) > (MIN_GAP_MS * 4):
+            # 兜底：若整段音频都高于门槛，armed 永远回不来 → 只切一次就卡死。
+            # 所以"高于门槛持续太久"时强制放行，让它退回"按间隔切"。
+            #
+            # 放行窗口分模式给：
+            #   动态 → 4 倍间隔（保守）。阈值跟着基线走，本来就很少持续高于，放宽一点更稳。
+            #   固定 → 1.6 倍间隔。固定门槛可能被调到 -60dB，这时**整首歌都高于门槛**，
+            #          若还用 4 倍（≈920ms）就只能切到 ~65BPM，明显跟不上歌，用户会以为坏了。
+            #          1.6 倍 ≈ 368ms，上限约 163BPM，够用且不会碎成噪音。
+            _force_mul = 1.6 if self.thr_mode == "fixed" else 4.0
+            _ready = (not self._armed) and \
+                     (now_ms - self._last_beat) > (MIN_GAP_MS * _force_mul)
+            if _ready and self.thr_mode == "fixed":
+                # 固定模式 + 持续高于门槛：再要求一个上升沿，
+                # 否则一首歌 4 分钟会变成匀速 160 拍的节拍器。
+                if self._rise_db(now_ms) < FIXED_RISE_DB:
+                    _ready = False
+            if _ready:
                 self._armed = True
             if self._armed:
                 self._armed = False

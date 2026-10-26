@@ -19,6 +19,7 @@
   function AudioBeat(o) {
     o = o || {};
     this.sensitivity = o.sensitivity != null ? o.sensitivity : 5;
+    this.fixedDb = o.fixedDb != null ? o.fixedDb : -30;
     this.thrMode = o.thrMode || "dynamic";       // dynamic | fixed
     this.url = o.url || "/gallery4comfyui/api/audio/stream";
 
@@ -149,6 +150,15 @@
     this.thrMode = m;
     try {
       await fetch(this.url.replace("/stream", "/thr-mode") + "?mode=" + m,
+        { method: "POST" });
+    } catch (e) {}
+  };
+
+  /** 固定模式的门槛（绝对 dB）。数值越大 = 门槛越高 = 越难触发。 */
+  AudioBeat.prototype.setFixedDb = async function (v) {
+    this.fixedDb = v;
+    try {
+      await fetch(this.url.replace("/stream", "/fixed-db") + "?value=" + v,
         { method: "POST" });
     } catch (e) {}
   };
