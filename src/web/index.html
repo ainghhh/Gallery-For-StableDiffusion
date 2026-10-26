@@ -671,7 +671,7 @@
 
 <div class="topbar">
   <div class="tb-inner">
-    <span class="title"><span data-i18n="title">Gallery4ComfyUI</span> <small id="srcLabel" data-i18n="subComfy">ComfyUI 图片</small></span>
+    <span class="title"><span data-i18n="title">Gallery4ComfyUI</span></span>
     <span class="ver-tag" title="Ctrl+F5 强刷后应看到 v1.3.0">v1.3.0</span>
     <div class="srctabs">
       <button class="srctab on" data-src="comfyui" data-i18n="tabComfy">ComfyUI</button>
@@ -1549,19 +1549,16 @@ document.querySelectorAll(".srctab").forEach(b=>{
     b.classList.add("on");
     if(b.dataset.src === "fav"){
       showView("fav");
-      $("srcLabel").textContent = LANG === "zh" ? "收藏" : "Favorites";
       loadFolders(); loadFavChains(); loadFavGrid(true);
       return;
     }
     if(b.dataset.src === "artist"){
       showView("artist");
-      $("srcLabel").textContent = LANG === "zh" ? "🎨 画师" : "🎨 Artists";
       loadArtists();
       return;
     }
     if(b.dataset.src === "artlib"){
       showView("artlib");
-      $("srcLabel").textContent = LANG === "zh" ? "🌐 Danbooru 画师库" : "🌐 Danbooru Artists";
       artlibEnsure();   // 懒加载：首次点开才请求
       return;
     }
@@ -1569,7 +1566,6 @@ document.querySelectorAll(".srctab").forEach(b=>{
     SEL.clear(); $("selBar").hidden = true;
     $("favGrid").querySelectorAll(".item.sel").forEach(d=>d.classList.remove("sel"));
     SRC = b.dataset.src;
-    $("srcLabel").textContent = SRC === "comfyui" ? "ComfyUI 图片" : SRC === "video" ? "🎬 视频" : "WebUI 图片";
     $("modelSel").value = ""; $("samplerSel").value = "";
     $("btnFav").classList.remove("active");
     refreshSource();

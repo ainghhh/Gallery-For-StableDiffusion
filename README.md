@@ -1,7 +1,7 @@
 # Gallery4ComfyUI
 
 <p>
-  <img alt="Version" src="https://img.shields.io/badge/version-v1.3.9-3b6ef5">
+  <img alt="Version" src="https://img.shields.io/badge/version-v1.3.10-3b6ef5">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="ComfyUI" src="https://img.shields.io/badge/ComfyUI-0.3x+-blueviolet">
   <img alt="Dependencies" src="https://img.shields.io/badge/dependencies-none-orange">
