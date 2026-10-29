@@ -466,7 +466,7 @@ async def api_slide_meta(request):
         return _json({"error": str(e)})
 
 
-def _wraps(fn, kw=(), post=False):
+def _wraps(fn, kw=(), post=False, wrap_items=False):
     """把 query 参数按名字转成 fn 的实参。
 
     用**关键字**调用而非位置：函数签名顺序变了也不会错位。
@@ -530,7 +530,12 @@ def _wraps(fn, kw=(), post=False):
                 v = _cast(k, src.get(k))
                 if v is not None:
                     kwargs[k] = v
-            return _json(fn(**kwargs))
+            result = fn(**kwargs)
+            # 有些接口前端按 {items:[...]} 读（模型 / LoRA / 采样器）。
+            # 返回裸数组的话 r.items 是 undefined，下拉就永远是空的。
+            if wrap_items and isinstance(result, list):
+                result = {"items": result}
+            return _json(result)
         except Exception as e:
             # 写进日志，别让错误只藏在 JSON 里没人看得见
             try:
@@ -750,20 +755,30 @@ def build_app():
                                             "theme", "technique", "composition",
                                             "rating", "min_posts", "sort", "page", "page_size")),
     }
+    # 这三条前端按 {items:[...]} 读，必须包一层（其余接口返回 dict 或前端不用）
+    _ITEM_ROUTES = {"models", "samplers", "loras"}
     for route, (fn, kw) in GETS.items():
         f = getattr(G, fn, None)
         if f is None:
             continue
-        app.router.add_get(P + "/api/" + route, _wraps(f, kw))
+        app.router.add_get(
+            P + "/api/" + route,
+            _wraps(f, kw, wrap_items=(route in _ITEM_ROUTES)))
 
     if hasattr(G, "folder_images"):
         # 注意：folder_images(name, source="") 里 name 是**必需**参数，
         # 空值不能像其它可选参数那样跳过，否则会 TypeError。
         async def api_folder_images(request):
             try:
-                name = request.query.get("name") or ""
-                src = request.query.get("source") or "comfyui"
-                return _json(G.folder_images(name, src))
+                # 前端发的是 ?folder=xxx（不是 name=），只读 name 会永远拿到空文件夹
+                name = (request.query.get("folder")
+                        or request.query.get("name") or "")
+                # 不传 source 时**不要**默认成 comfyui —— 收藏可能来自 WebUI，
+                # 按单源过滤会让收藏星标和收藏页漏掉另一半。
+                src = request.query.get("source") or ""
+                # 前端按 {items:[...]} 读（r.items.map）；返回裸数组会抛异常，
+                # 导致 DEFAULT_FAVS 一直为空 → 卡片上的收藏星标永远不亮。
+                return _json({"items": G.folder_images(name, src)})
             except Exception as e:
                 log(f"folder_images 出错: {e!r}")
                 return _json({"items": [], "total": 0, "error": str(e)})

@@ -2212,7 +2212,7 @@ function closeSlideOverlay(){
 async function loadDefaultFavs(){
   try{
     const r = await api("/api/folders/images?folder=" + encodeURIComponent("默认收藏"));
-    DEFAULT_FAVS = new Set(r.items.map(x=>x.source + ":" + x.file));
+    DEFAULT_FAVS = new Set(((r && r.items) || []).map(x=>x.source + ":" + x.file));
   }catch(e){}
 }
 async function toggleFav(src, file){
