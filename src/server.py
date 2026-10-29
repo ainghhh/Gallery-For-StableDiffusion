@@ -283,7 +283,8 @@ async def api_boot(request):
         vdir = os.path.join(out, "video") if out else ""
         if vdir and os.path.isdir(vdir):
             try:
-                G.start_scan("video")
+                # refresh=True：和 comfyui/webui 一致，启动时也增量捡新增视频
+                G.start_scan("video", refresh=True)
                 started.append("video")
             except Exception as e:
                 log(f"  start_scan(video) 失败: {e!r}")

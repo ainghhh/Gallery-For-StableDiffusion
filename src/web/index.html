@@ -2090,6 +2090,7 @@ async function quickRefresh(){
     await Promise.allSettled([
       api("/api/scan?source=comfyui&refresh=1"),
       api("/api/scan?source=webui&refresh=1"),
+      api("/api/scan?source=video&refresh=1"),
     ]);
     if(_quickTimer) clearInterval(_quickTimer);
     _quickTimer = setInterval(async ()=>{

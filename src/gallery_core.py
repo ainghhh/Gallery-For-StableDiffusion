@@ -200,7 +200,7 @@ def read_png_texts(path):
 # ComfyUI 条目解析
 # ---------------------------------------------------------------------------
 # 解析器版本：正向/负向提取逻辑每变一次 +1（存量条目 pv 不一致 → 下次增量扫描自动重解析）
-_PARSE_VERSION = 4
+_PARSE_VERSION = 5
 _TEXT_KEYS = ("resolved_prompt", "positive", "text_0", "text", "prompt", "string_a", "string_b",
               "artist_tags", "character_tags", "clothing_tags", "background_tags", "pose_tags",
               "extra_text", "top_copyrights", "signature_tags", "lora_str",
