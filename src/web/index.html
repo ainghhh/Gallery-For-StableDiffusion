@@ -63,6 +63,33 @@
     padding:4px 8px !important; font-size:12px !important; border-radius:7px !important;
     max-width:96px; flex:0 0 auto;
   }
+  /* 更新提示条 */
+  #updateBar{
+    display:flex; align-items:center; gap:10px;
+    padding:8px 16px; font-size:13px;
+    background:linear-gradient(90deg,
+      color-mix(in srgb, var(--accent) 16%, var(--card)),
+      color-mix(in srgb, var(--accent) 6%, var(--card)));
+    border-bottom:1px solid var(--line);
+    animation: ubIn .28s var(--ease-out);
+  }
+  #updateBar[hidden]{display:none !important}
+  @keyframes ubIn{ from{opacity:0; transform:translateY(-6px)} to{opacity:1; transform:none} }
+  #updateBar .ub-ico{font-size:14px}
+  #updateBar .ub-txt{flex:0 0 auto}
+  #updateBar .ub-go{
+    margin-left:auto; background:var(--accent); color:#fff; border:0;
+    padding:4px 14px; border-radius:7px; font-size:12.5px; cursor:pointer;
+  }
+  #updateBar .ub-later{
+    background:transparent; color:var(--dim); border:1px solid var(--line);
+    padding:4px 12px; border-radius:7px; font-size:12.5px; cursor:pointer;
+  }
+  #updateBar .ub-go:hover{filter:brightness(1.08)}
+  #updateBar .ub-later:hover{color:var(--txt)}
+  /* 检查中：版本号轻微呼吸 */
+  .ver-tag.checking{animation: verPulse 1s ease-in-out infinite}
+  @keyframes verPulse{ 0%,100%{opacity:.45} 50%{opacity:1} }
   .ver-tag{font-size:10px; color:var(--dim); background:var(--bg); border:1px solid var(--line); border-radius:5px; padding:1px 6px; margin-right:2px; opacity:.75}
   input, select{background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; font-size:13.5px; color:var(--txt); outline:none; font-family:inherit}
   input:focus, select:focus{border-color:var(--accent)}
@@ -704,10 +731,18 @@
 <body data-theme="light">
 <div id="errbar" hidden></div>
 
+<!-- 有新版本时的提示条（默认隐藏；检查失败不会出现） -->
+<div id="updateBar" hidden>
+  <span class="ub-ico">🆕</span>
+  <span class="ub-txt">发现新版本 <b id="ubVer">—</b></span>
+  <button class="ub-go" id="ubGo">前往下载</button>
+  <button class="ub-later" id="ubLater">稍后</button>
+</div>
+
 <div class="topbar">
   <div class="tb-inner">
     <span class="title"><span data-i18n="title">Gallery4ComfyUI</span></span>
-    <span class="ver-tag" title="Ctrl+F5 强刷后应看到 v1.3.0">v1.3.0</span>
+    <span class="ver-tag" id="verTag" title="点击检查更新" style="cursor:pointer">v…</span>
     <div class="srctabs">
       <button class="srctab on" data-src="comfyui" data-i18n="tabComfy">ComfyUI</button>
       <button class="srctab" data-src="webui" data-i18n="tabWebui">WebUI</button>
@@ -4369,6 +4404,92 @@ async function boot(){
   await loadModels(); await loadSamplers(); await loadLoras(); await loadStats();
   await _bootScan(false);
 }
+
+// ---------- 更新检查（GitHub Releases）----------
+// 设计：绝不阻塞启动；任何异常都静默；同一天最多提示一次；「稍后」= 跳过这个版本
+const UPD = {
+  atKey: "gal4c_updAt",
+  skipKey: "gal4c_updSkip",
+  data: null,
+};
+function _ls(k, v){
+  try{
+    if(v === undefined) return localStorage.getItem(k);
+    localStorage.setItem(k, v);
+  }catch(e){ return null; }
+}
+function _showUpdateBar(d){
+  const bar = $("updateBar");
+  if(!bar) return;
+  if(!d || !d.has_update){ bar.hidden = true; return; }
+  if(_ls(UPD.skipKey) === (d.latest || "")){ bar.hidden = true; return; }
+  $("ubVer").textContent = d.latest || "";
+  bar.hidden = false;
+}
+/** quiet=true 时只更新版本号，不弹提示条（用于 24 小时内重复检查） */
+async function checkUpdate(force, quiet){
+  const tag = $("verTag");
+  try{
+    if(tag) tag.classList.add("checking");
+    const r = await api("/api/update/check" + (force ? "?force=1" : ""));
+    UPD.data = r || {};
+    if(tag){
+      const cur = (r && r.current) ? r.current : "";
+      tag.textContent = cur ? ("v" + cur) : "—";
+      if(r && r.ok){
+        tag.title = r.has_update
+          ? ("发现新版本 " + r.latest + "（点击重新检查）")
+          : ("当前 v" + cur + "，已是最新（点击重新检查）");
+      } else {
+        tag.title = "上次检查失败：" + ((r && r.error) || "未知原因") + "（点击重试）";
+      }
+    }
+    if(quiet){ const b = $("updateBar"); if(b) b.hidden = true; }
+    else _showUpdateBar(r);
+    if(force){
+      if(r && r.ok && r.has_update) showToast("🆕 发现新版本 " + r.latest);
+      else if(r && r.ok) showToast("✅ 已是最新版本 v" + r.current);
+      else showToast("⚠️ " + ((r && r.error) || "检查更新失败"));
+    }
+    if(r && r.ok) _ls(UPD.atKey, String(Date.now()));
+  }catch(e){
+    // 接口不存在（如插件版）或网络异常：不打扰，只把版本号降级显示
+    if(force) showToast("⚠️ 检查更新失败（" + (e.message || e) + "）");
+    if(tag){
+      if(tag.textContent === "v…" || tag.textContent === "v?") tag.textContent = "—";
+      tag.title = "无法获取版本信息（点击重试）";
+    }
+    const b = $("updateBar"); if(b) b.hidden = true;
+  }finally{
+    if(tag) tag.classList.remove("checking");
+  }
+}
+try{
+  const tag = $("verTag");
+  if(tag) tag.onclick = ()=>checkUpdate(true, false);
+  const go = $("ubGo");
+  if(go) go.onclick = ()=>{
+    const u = (UPD.data && UPD.data.url) ||
+      "https://github.com/ainghhh/Gallery-For-StableDiffusion/releases";
+    // 交给后端用系统浏览器打开（WebView2 里 window.open 不可靠）
+    api("/api/open-url?url=" + encodeURIComponent(u)).then(r=>{
+      if(!r || !r.ok) showToast("请手动打开：" + u);
+    }).catch(()=>showToast("请手动打开：" + u));
+  };
+  const later = $("ubLater");
+  if(later) later.onclick = ()=>{
+    if(UPD.data && UPD.data.latest) _ls(UPD.skipKey, UPD.data.latest);
+    const b = $("updateBar"); if(b) b.hidden = true;
+  };
+  // 启动 4 秒后再检查（完全不阻塞主流程）
+  setTimeout(()=>{
+    const last = parseInt(_ls(UPD.atKey) || "0", 10) || 0;
+    const fresh = Date.now() - last > 24 * 3600 * 1000;
+    // 24 小时内：只把版本号显示出来，不再弹提示条打扰
+    checkUpdate(false, !fresh);
+  }, 4000);
+}catch(e){}
+
 checkSettings();
 // 把 [data-ic] 占位填成 SVG 图标（在脚本末尾统一画一次）
 try { if(window.ICON) ICON.paint(document); } catch(e){}

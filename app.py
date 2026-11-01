@@ -202,6 +202,29 @@ def main():
     except Exception:
         _ICON = None
 
+    # ---- WebView2 用户数据目录（localStorage / cookie / 缓存都在这）----
+    def _pick_storage_path():
+        cands = []
+        cands.append(os.path.join(CFG.APP_DIR, "userdata", "webview"))
+        la = os.environ.get("LOCALAPPDATA") or ""
+        if la:
+            cands.append(os.path.join(la, "Gallery4ComfyUI", "webview"))
+        for c in cands:
+            try:
+                os.makedirs(c, exist_ok=True)
+                probe = os.path.join(c, ".w_test")
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("x")
+                os.remove(probe)
+                return c
+            except Exception:
+                continue
+        return None
+
+    _storage = _pick_storage_path()
+    if _storage:
+        log(f"WebView 存储目录 = {_storage}")
+
     win = webview.create_window(
         TITLE, start_url,
         width=int(wcfg.get("w") or 1520),
@@ -235,6 +258,9 @@ def main():
         #    这个版本的 pywebview 里 create_window 不收 icon，
         #    传了会直接 TypeError、进程秒退（实测踩过）。
         _start_kw = {"debug": False, "private_mode": False}
+        # 固定存储目录：localStorage 才不会跟着 %APPDATA% 漂
+        if _storage:
+            _start_kw["storage_path"] = _storage
         if _ICON:
             _start_kw["icon"] = _ICON
         webview.start(**_start_kw)

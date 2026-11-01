@@ -151,6 +151,70 @@ def free_port():
         return s.getsockname()[1]
 
 
+# ---------------------------------------------------------------------------
+# 稳定端口
+#
+# 为什么必须固定：页面 origin 是 http://127.0.0.1:<端口>，而 localStorage
+# 是按 origin 隔离的。端口一变 = 换了一个全新的空存储桶，
+# 用户保存的主题 / 幻灯片+音频设置会全部"消失"（其实是读不到了）。
+# ---------------------------------------------------------------------------
+_PORT_BASE = 51833          # 固定端口起点
+_PORT_TRIES = 200           # 往后最多试这么多个
+
+
+def _port_usable(p):
+    """本地回环上这个端口当前能不能 bind。"""
+    try:
+        p = int(p)
+    except Exception:
+        return False
+    if not (1024 <= p <= 65535):
+        return False
+    try:
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", p))
+        return True
+    except OSError:
+        return False
+
+
+def pick_stable_port(preferred=0):
+    """挑一个稳定的端口：优先用上次的，被占用了才换。"""
+    try:
+        preferred = int(preferred or 0)
+    except Exception:
+        preferred = 0
+    if preferred and _port_usable(preferred):
+        return preferred
+    for off in range(_PORT_TRIES):
+        p = _PORT_BASE + off
+        if _port_usable(p):
+            return p
+    # 整段都被占了（极罕见）：退回系统随机
+    return free_port()
+
+
+def persist_port(port):
+    """把实际使用的端口写回 config.json，下次启动复用。"""
+    try:
+        port = int(port)
+    except Exception:
+        return
+    try:
+        cur = CFG.load()
+        if int(cur.get("port") or 0) == port:
+            return
+        cur["port"] = port
+        if CFG.save(cur):
+            log(f"端口已固定为 {port}（下次启动复用，localStorage 设置才不会丢）")
+    except Exception as e:
+        try:
+            log(f"端口写回 config.json 失败: {e!r}")
+        except Exception:
+            pass
+
+
 def _roots():
     out = [(_cfg.get("comfy_output") or "").strip(), (_cfg.get("webui_root") or "").strip()]
     r = []
@@ -692,6 +756,107 @@ async def api_audio_stream(request):
     finally:
         _AB.ENGINE.unsubscribe(q)
     return resp
+
+
+# ---------------------------------------------------------------------------
+# 更新检查（GitHub Releases）
+#
+# 设计要求：**绝不能影响主功能**
+#   · 任何异常都吞掉，只返回 ok=False + 人话错误
+#   · 8 秒超时，不阻塞（前端异步调用）
+#   · 结果缓存 30 分钟，避免 GitHub 匿名接口限流（60 次/小时）
+#   · 只"检查"，不自动下载、不自动替换文件
+# ---------------------------------------------------------------------------
+_GITHUB_REPO = "ainghhh/Gallery-For-StableDiffusion"
+_UPDATE_CACHE = {"at": 0.0, "data": None}
+_UPDATE_TTL = 1800.0          # 30 分钟
+
+
+def _ver_tuple(v):
+    """'v1.3.14' / '1.3.14' / '1.3.14-rc1' → (1,3,14)，不可解析时返回 (0,)"""
+    try:
+        t = str(v or "").strip().lstrip("vV")
+        m = re.match(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", t)
+        if not m:
+            return (0,)
+        return tuple(int(x or 0) for x in m.groups())
+    except Exception:
+        return (0,)
+
+
+async def api_update_check(request):
+    """检查有没有新版本。永不抛异常。"""
+    import time as _t
+    force = (request.query.get("force") or "").lower() in ("1", "true", "yes")
+    now = _t.time()
+    if (not force and _UPDATE_CACHE["data"] is not None
+            and (now - _UPDATE_CACHE["at"]) < _UPDATE_TTL):
+        return _json(_UPDATE_CACHE["data"])
+
+    cur = getattr(CFG, "VERSION", "0.0.0")
+    out = {"ok": False, "current": cur, "latest": "", "has_update": False,
+           "url": "https://github.com/%s/releases" % _GITHUB_REPO,
+           "notes": "", "published_at": "", "error": "", "cached": False}
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.github.com/repos/%s/releases/latest" % _GITHUB_REPO,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "Gallery4ComfyUI-UpdateCheck"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = r.read().decode("utf-8", "replace")
+        j = json.loads(raw)
+        if not isinstance(j, dict):
+            raise ValueError("GitHub 返回的不是 JSON 对象")
+        latest = str(j.get("tag_name") or "").strip()
+        if not latest:
+            raise ValueError("GitHub 未返回版本号")
+        out["latest"] = latest
+        out["url"] = str(j.get("html_url") or out["url"])
+        out["notes"] = str(j.get("body") or "")[:4000]
+        out["published_at"] = str(j.get("published_at") or "")
+        out["has_update"] = _ver_tuple(latest) > _ver_tuple(cur)
+        out["ok"] = True
+        _UPDATE_CACHE["data"] = out
+        _UPDATE_CACHE["at"] = now
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        if "403" in msg or "rate limit" in low:
+            out["error"] = "GitHub 接口限流，稍后再试"
+        elif "timed out" in low or "timeout" in low:
+            out["error"] = "网络超时"
+        elif "urlopen error" in low or "getaddrinfo" in low or "connection" in low:
+            out["error"] = "连不上 GitHub（网络或代理问题）"
+        elif "404" in msg:
+            out["error"] = "仓库或 Release 不存在"
+        else:
+            out["error"] = "检查失败：" + msg[:120]
+        # 失败时如果手里有旧的缓存，仍然返回旧结果并标注
+        if _UPDATE_CACHE["data"] is not None:
+            cached = dict(_UPDATE_CACHE["data"])
+            cached["cached"] = True
+            cached["error"] = out["error"]
+            return _json(cached)
+    return _json(out)
+
+
+async def api_open_url(request):
+    """用系统默认浏览器打开链接。
+
+    安全约束：只允许打开本仓库的 GitHub 页面（严格前缀白名单），
+    不接受任意 URL —— 避免被拼出 file:// / 命令行注入之类的东西。
+    """
+    try:
+        u = (request.query.get("url") or "").strip()
+        allow = ("https://github.com/ainghhh/Gallery-For-StableDiffusion",)
+        if not u.startswith(allow):
+            return _json({"ok": False, "error": "不允许的地址"})
+        import webbrowser
+        webbrowser.open(u)
+        return _json({"ok": True})
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)})
 
 
 def build_app():
@@ -1261,6 +1426,7 @@ def build_app():
             "data_ok": os.path.isdir((_cfg.get("data_dir") or "").strip() or "\0"),
             "artlib_installed": bool(getattr(G, "_data_file", lambda n: "")("artists.jsonl")),
             "frozen": bool(getattr(sys, "frozen", False)),
+            "version": getattr(CFG, "VERSION", ""),
         })
 
     async def api_quit(request):
@@ -1268,6 +1434,8 @@ def build_app():
         return _json({"ok": True})
 
     app.router.add_get(P + "/api/diag", api_diag)
+    app.router.add_get(P + "/api/update/check", api_update_check)
+    app.router.add_get(P + "/api/open-url", api_open_url)
     app.router.add_post(P + "/api/quit", api_quit)
     return app
 
@@ -1277,7 +1445,9 @@ def build_app():
 # ---------------------------------------------------------------------------
 class Server:
     def __init__(self, port=None):
-        self.port = _int(port) or _int(_cfg.get("port")) or free_port()
+        # 稳定端口：优先沿用配置里的，否则从固定区间挑一个并记下来
+        self.port = pick_stable_port(_int(port) or _int(_cfg.get("port")))
+        persist_port(self.port)
         self.loop = None
         self.runner = None
         self._thread = None
@@ -1290,9 +1460,26 @@ class Server:
 
             async def main():
                 app = build_app()
-                self.runner = web.AppRunner(app, access_log=None)
-                await self.runner.setup()
-                await web.TCPSite(self.runner, "127.0.0.1", self.port).start()
+                last_err = None
+                for attempt in range(4):
+                    try:
+                        self.runner = web.AppRunner(app, access_log=None)
+                        await self.runner.setup()
+                        await web.TCPSite(self.runner, "127.0.0.1", self.port).start()
+                        if attempt:
+                            persist_port(self.port)   # 换过端口 → 记下来
+                        last_err = None
+                        break
+                    except OSError as ex:
+                        last_err = ex
+                        log(f"端口 {self.port} 绑定失败（{ex}），换一个重试")
+                        try:
+                            await self.runner.cleanup()
+                        except Exception:
+                            pass
+                        self.port = pick_stable_port(0)
+                if last_err is not None:
+                    raise last_err
                 self._ready.set()
                 while True:
                     await asyncio.sleep(3600)
