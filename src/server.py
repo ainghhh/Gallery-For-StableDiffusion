@@ -816,6 +816,19 @@ async def api_update_check(request):
         out["notes"] = str(j.get("body") or "")[:4000]
         out["published_at"] = str(j.get("published_at") or "")
         out["has_update"] = _ver_tuple(latest) > _ver_tuple(cur)
+        # 找发布包（优先 .zip），供一键更新使用
+        asset_url, asset_size, asset_name = "", 0, ""
+        for a in (j.get("assets") or []):
+            nm = str(a.get("name") or "")
+            if nm.lower().endswith(".zip"):
+                asset_url = str(a.get("browser_download_url") or "")
+                asset_size = int(a.get("size") or 0)
+                asset_name = nm
+                break
+        out["asset_url"] = asset_url
+        out["asset_size"] = asset_size
+        out["asset_name"] = asset_name
+        out["can_auto_update"] = bool(asset_url)
         out["ok"] = True
         _UPDATE_CACHE["data"] = out
         _UPDATE_CACHE["at"] = now
@@ -857,6 +870,239 @@ async def api_open_url(request):
         return _json({"ok": True})
     except Exception as e:
         return _json({"ok": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# 一键更新：下载 → 校验 → 备份 → 生成替换脚本 → 重启
+#
+# 为什么用外部 .bat 而不是自己替换：Windows 上正在运行的 exe 不能覆盖。
+# 所以先写一个批处理，等本进程退出后再替换文件，最后启动新版。
+# ---------------------------------------------------------------------------
+_UPDATE_STAGING = os.path.join(APP_DIR, "_update_staging")
+_UP = {
+    "stage": "idle",      # idle / downloading / extracting / backing_up / ready / applying / error
+    "percent": 0,
+    "message": "",
+    "error": "",
+    "version": "",
+    "backup": "",
+    "auto": True,
+}
+_UP_LOCK = threading.Lock()
+
+
+def _up_set(**kw):
+    with _UP_LOCK:
+        _UP.update(kw)
+
+
+def _safe_extract(zf, dest):
+    """解压前逐个校验成员路径，挡住 ../ 越界和绝对路径。"""
+    base = os.path.realpath(dest)
+    for m in zf.namelist():
+        name = m.replace("\\", "/")
+        parts = [x for x in name.split("/") if x not in ("", ".")]
+        if name.startswith("/") or ".." in parts or (parts and ":" in parts[0]):
+            raise ValueError("压缩包含非法路径：" + m)
+        target = os.path.realpath(os.path.join(dest, *parts))
+        if not (target == base or target.startswith(base + os.sep)):
+            raise ValueError("压缩包越界：" + m)
+    zf.extractall(dest)
+
+
+def _backup_userdata(old_ver, new_ver):
+    """把不可再生的用户数据打成 zip（收藏在 folders.json，必须保住）。
+
+    故意**不含** userdata/index、userdata/thumbs、userdata/webview ——
+    这几个是缓存，体积大且能重建。
+    """
+    import time as _t
+    import zipfile as _zf
+    bdir = os.path.join(APP_DIR, "backups")
+    os.makedirs(bdir, exist_ok=True)
+    stamp = _t.strftime("%Y%m%d_%H%M%S")
+    name = "pre_update_%s_to_%s_%s.zip" % (old_ver or "?", new_ver or "?", stamp)
+    out = os.path.join(bdir, name)
+    with _zf.ZipFile(out, "w", _zf.ZIP_DEFLATED) as z:
+        cfgp = os.path.join(APP_DIR, "config.json")
+        if os.path.isfile(cfgp):
+            z.write(cfgp, "config.json")
+        ud = os.path.join(APP_DIR, "userdata")
+        if os.path.isdir(ud):
+            for f in sorted(os.listdir(ud)):
+                p = os.path.join(ud, f)
+                if os.path.isfile(p):
+                    z.write(p, "userdata/" + f)
+        dd = os.path.join(APP_DIR, "data")
+        if os.path.isdir(dd):
+            for root, _dirs, files in os.walk(dd):
+                for f in files:
+                    p = os.path.join(root, f)
+                    rel = os.path.relpath(p, APP_DIR).replace("\\", "/")
+                    try:
+                        z.write(p, rel)
+                    except Exception:
+                        pass
+    return out
+
+
+def _build_updater_bat(app_dir, stage, new_ver):
+    """生成替换脚本。**只动程序文件**，用户数据一条命令都不碰。"""
+    src = os.path.join(stage, "Gallery4ComfyUI")
+    bat = os.path.join(app_dir, "_apply_update.bat")
+    exe = os.path.join(app_dir, "Gallery4ComfyUI.exe")
+    L = [
+        "@echo off",
+        "chcp 65001 >nul 2>&1",
+        "title Gallery4ComfyUI update",
+        "echo Waiting for app to exit...",
+        ":wait",
+        'tasklist /NH /FI "IMAGENAME eq Gallery4ComfyUI.exe" 2>nul | find /I "Gallery4ComfyUI.exe" >nul',
+        "if not errorlevel 1 (",
+        "  timeout /t 1 /nobreak >nul",
+        "  goto wait",
+        ")",
+        "echo Replacing program files...",
+        # _internal 是程序目录，可以镜像（顺带清掉旧版本残留 dll）
+        'robocopy "%s\\_internal" "%s\\_internal" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, app_dir),
+        # 只点名两个文件 → config.json 永远不会被覆盖
+        'robocopy "%s" "%s" Gallery4ComfyUI.exe app.ico /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, app_dir),
+        # data 只增不删（用户的画师库自定义文件必须留着）
+        'if exist "%s\\data" robocopy "%s\\data" "%s\\data" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, src, app_dir),
+        "echo Starting new version...",
+        'cd /d "%s"' % app_dir,
+        'start "" "%s"' % exe,
+        'rmdir /s /q "%s" 2>nul' % stage,
+        'del "%~f0"',
+    ]
+    with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(L) + "\n")
+    return bat
+
+
+def _do_update(url, new_ver, old_ver, expect_size=0):
+    """后台执行：下载 → 校验 → 解压 → 备份。全部成功才置 ready。"""
+    import urllib.request
+    import zipfile as _zf
+    stage_dir = _UPDATE_STAGING
+    try:
+        # 清理上次残留
+        if os.path.isdir(stage_dir):
+            import shutil as _sh
+            _sh.rmtree(stage_dir, ignore_errors=True)
+        os.makedirs(stage_dir, exist_ok=True)
+
+        _up_set(stage="downloading", percent=0, message="正在下载更新包…", error="")
+        dl = os.path.join(stage_dir, "download.zip")
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Gallery4ComfyUI-Updater", "Accept": "*/*"})
+        total = expect_size or 0
+        got = 0
+        with urllib.request.urlopen(req, timeout=60) as r, open(dl, "wb") as f:
+            try:
+                total = int(r.headers.get("Content-Length") or total or 0)
+            except Exception:
+                pass
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if total:
+                    _up_set(percent=min(99, int(got * 100 / total)),
+                            message="正在下载… %d%%" % int(got * 100 / total))
+        if got < 1024:
+            raise ValueError("下载内容过小（%d 字节），可能网络异常" % got)
+        if expect_size and got != expect_size:
+            # 大小不符通常是代理/镜像返回了错误页，宁可停下也不装半个包
+            raise ValueError("下载大小不符（期望 %d，实际 %d）" % (expect_size, got))
+
+        _up_set(stage="extracting", percent=0, message="正在校验并解压…")
+        with _zf.ZipFile(dl) as z:
+            bad = z.testzip()
+            if bad:
+                raise ValueError("压缩包损坏（%s）" % bad)
+            _safe_extract(z, stage_dir)
+        try:
+            os.remove(dl)
+        except Exception:
+            pass
+
+        # 结构校验：必须真的有 exe 和 _internal
+        exe_in = os.path.join(stage_dir, "Gallery4ComfyUI", "Gallery4ComfyUI.exe")
+        if not os.path.isfile(exe_in):
+            raise ValueError("更新包结构不对：没找到 Gallery4ComfyUI.exe")
+        if not os.path.isdir(os.path.join(stage_dir, "Gallery4ComfyUI", "_internal")):
+            raise ValueError("更新包结构不对：没找到 _internal 目录")
+
+        _up_set(stage="backing_up", percent=0, message="正在备份你的收藏和配置…")
+        bk = _backup_userdata(old_ver, new_ver)
+
+        _up_set(stage="ready", percent=100,
+                message="更新包已就绪，点击「重启并更新」完成",
+                version=new_ver, backup=bk, error="")
+    except Exception as e:
+        import traceback
+        log("一键更新失败: %r\n%s" % (e, traceback.format_exc()))
+        _up_set(stage="error", percent=0,
+                message="", error=str(e)[:300], auto=False)
+
+
+async def api_update_apply(request):
+    """开始下载更新包（后台）。不会自动重启。"""
+    try:
+        if _UP["stage"] in ("downloading", "extracting", "backing_up"):
+            return _json({"ok": True, "stage": _UP["stage"]})
+        info = _UPDATE_CACHE["data"]
+        if not info or not info.get("asset_url"):
+            # 没有缓存就现查一次
+            fake = await api_update_check(SimpleNamespace(query={"force": "1"}))
+            info = _UPDATE_CACHE["data"] or {}
+        if not info.get("asset_url"):
+            return _json({"ok": False, "error": "没找到可下载的发布包，请手动下载",
+                          "url": info.get("url") or ""})
+        if not info.get("has_update"):
+            return _json({"ok": False, "error": "当前已是最新版本"})
+        _up_set(stage="downloading", percent=0, message="准备下载…",
+                error="", version=info.get("latest", ""), auto=True)
+        threading.Thread(
+            target=_do_update,
+            args=(info["asset_url"], info.get("latest", ""), info.get("current", ""),
+                  int(info.get("asset_size") or 0)),
+            daemon=True, name="gallery-update").start()
+        return _json({"ok": True, "stage": "downloading"})
+    except Exception as e:
+        log("api_update_apply 出错: %r" % (e,))
+        return _json({"ok": False, "error": str(e)[:200]})
+
+
+async def api_update_progress(request):
+    with _UP_LOCK:
+        return _json(dict(_UP))
+
+
+async def api_update_restart(request):
+    """写替换脚本 → 脱离父进程启动 → 本进程退出。"""
+    try:
+        if _UP["stage"] != "ready":
+            return _json({"ok": False, "error": "更新包还没准备好"})
+        app_dir = APP_DIR
+        exe = os.path.join(app_dir, "Gallery4ComfyUI.exe")
+        bat = _build_updater_bat(app_dir, _UPDATE_STAGING, _UP.get("version", ""))
+        _up_set(stage="applying", percent=100, message="正在重启并替换文件…")
+        log("开始应用更新：%s" % bat)
+        # DETACHED_PROCESS：批处理不随本进程一起被杀
+        subprocess.Popen(["cmd", "/c", bat], cwd=app_dir,
+                         creationflags=0x00000008,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, close_fds=True)
+        threading.Timer(0.8, lambda: os._exit(0)).start()
+        return _json({"ok": True})
+    except Exception as e:
+        log("api_update_restart 出错: %r" % (e,))
+        _up_set(stage="ready", error=str(e)[:200])
+        return _json({"ok": False, "error": str(e)[:200]})
 
 
 def build_app():
@@ -1436,6 +1682,9 @@ def build_app():
     app.router.add_get(P + "/api/diag", api_diag)
     app.router.add_get(P + "/api/update/check", api_update_check)
     app.router.add_get(P + "/api/open-url", api_open_url)
+    app.router.add_post(P + "/api/update/apply", api_update_apply)
+    app.router.add_get(P + "/api/update/progress", api_update_progress)
+    app.router.add_post(P + "/api/update/restart", api_update_restart)
     app.router.add_post(P + "/api/quit", api_quit)
     return app
 

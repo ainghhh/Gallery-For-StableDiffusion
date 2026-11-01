@@ -87,6 +87,23 @@
   }
   #updateBar .ub-go:hover{filter:brightness(1.08)}
   #updateBar .ub-later:hover{color:var(--txt)}
+  #updateBar .ub-prog{
+    flex:1 1 200px; min-width:90px; max-width:320px; height:6px;
+    background:color-mix(in srgb, var(--line) 70%, transparent);
+    border-radius:99px; overflow:hidden;
+  }
+  #updateBar .ub-prog[hidden]{display:none !important}
+  #updateBar .ub-fill{
+    height:100%; width:0%; border-radius:99px;
+    background:var(--accent);
+    transition:width .25s var(--ease-out);
+  }
+  #updateBar .ub-link{
+    background:transparent; border:0; color:var(--dim);
+    font-size:12px; cursor:pointer; text-decoration:underline;
+    text-underline-offset:2px; padding:4px 2px;
+  }
+  #updateBar .ub-link:hover{color:var(--txt)}
   /* 检查中：版本号轻微呼吸 */
   .ver-tag.checking{animation: verPulse 1s ease-in-out infinite}
   @keyframes verPulse{ 0%,100%{opacity:.45} 50%{opacity:1} }
@@ -733,9 +750,11 @@
 
 <!-- 有新版本时的提示条（默认隐藏；检查失败不会出现） -->
 <div id="updateBar" hidden>
-  <span class="ub-ico">🆕</span>
-  <span class="ub-txt">发现新版本 <b id="ubVer">—</b></span>
-  <button class="ub-go" id="ubGo">前往下载</button>
+  <span class="ub-ico" id="ubIco">🆕</span>
+  <span class="ub-txt" id="ubMsg">发现新版本 <b id="ubVer">—</b></span>
+  <div class="ub-prog" id="ubProg" hidden><div class="ub-fill" id="ubFill"></div></div>
+  <button class="ub-link" id="ubManual" title="用浏览器手动下载">手动下载</button>
+  <button class="ub-go" id="ubGo">立即更新</button>
   <button class="ub-later" id="ubLater">稍后</button>
 </div>
 
@@ -4405,12 +4424,14 @@ async function boot(){
   await _bootScan(false);
 }
 
-// ---------- 更新检查（GitHub Releases）----------
-// 设计：绝不阻塞启动；任何异常都静默；同一天最多提示一次；「稍后」= 跳过这个版本
+// ---------- 更新检查 + 一键更新（GitHub Releases）----------
+// 绝不阻塞启动；任何异常都静默；同一天最多提示一次；「稍后」= 跳过这个版本
 const UPD = {
   atKey: "gal4c_updAt",
   skipKey: "gal4c_updSkip",
   data: null,
+  polling: null,
+  ready: false,
 };
 function _ls(k, v){
   try{
@@ -4418,15 +4439,30 @@ function _ls(k, v){
     localStorage.setItem(k, v);
   }catch(e){ return null; }
 }
+function _ub(){ return $("updateBar"); }
+function _ubReset(){
+  const bar = _ub(); if(!bar) return;
+  $("ubIco").textContent = "🆕";
+  $("ubMsg").innerHTML = '发现新版本 <b id="ubVer">' + ((UPD.data && UPD.data.latest) || "") + '</b>';
+  $("ubProg").hidden = true;
+  $("ubFill").style.width = "0%";
+  $("ubGo").textContent = "立即更新";
+  $("ubGo").disabled = false;
+  $("ubManual").hidden = false;
+  $("ubLater").hidden = false;
+  UPD.ready = false;
+}
 function _showUpdateBar(d){
-  const bar = $("updateBar");
+  const bar = _ub();
   if(!bar) return;
+  UPD.data = d || UPD.data;
   if(!d || !d.has_update){ bar.hidden = true; return; }
   if(_ls(UPD.skipKey) === (d.latest || "")){ bar.hidden = true; return; }
-  $("ubVer").textContent = d.latest || "";
+  _ubReset();
+  $("ubManual").hidden = !(d.asset_url || d.url);
   bar.hidden = false;
 }
-/** quiet=true 时只更新版本号，不弹提示条（用于 24 小时内重复检查） */
+/** quiet=true 时只更新版本号，不弹提示条（24 小时内重复检查用） */
 async function checkUpdate(force, quiet){
   const tag = $("verTag");
   try{
@@ -4444,7 +4480,7 @@ async function checkUpdate(force, quiet){
         tag.title = "上次检查失败：" + ((r && r.error) || "未知原因") + "（点击重试）";
       }
     }
-    if(quiet){ const b = $("updateBar"); if(b) b.hidden = true; }
+    if(quiet){ const b = _ub(); if(b) b.hidden = true; }
     else _showUpdateBar(r);
     if(force){
       if(r && r.ok && r.has_update) showToast("🆕 发现新版本 " + r.latest);
@@ -4453,25 +4489,113 @@ async function checkUpdate(force, quiet){
     }
     if(r && r.ok) _ls(UPD.atKey, String(Date.now()));
   }catch(e){
-    // 接口不存在（如插件版）或网络异常：不打扰，只把版本号降级显示
     if(force) showToast("⚠️ 检查更新失败（" + (e.message || e) + "）");
     if(tag){
       if(tag.textContent === "v…" || tag.textContent === "v?") tag.textContent = "—";
       tag.title = "无法获取版本信息（点击重试）";
     }
-    const b = $("updateBar"); if(b) b.hidden = true;
+    const b = _ub(); if(b) b.hidden = true;
   }finally{
     if(tag) tag.classList.remove("checking");
   }
 }
+
+/* ---------------- 一键更新 ---------------- */
+function _updStopPoll(){
+  if(UPD.polling){ clearInterval(UPD.polling); UPD.polling = null; }
+}
+async function updateStart(){
+  _updStopPoll();
+  $("ubIco").textContent = "⬇️";
+  $("ubMsg").textContent = "准备下载…（收藏和配置会自动备份）";
+  $("ubProg").hidden = false;
+  $("ubFill").style.width = "2%";
+  $("ubGo").disabled = true;
+  $("ubManual").hidden = true;
+  $("ubLater").hidden = true;
+  let r = null;
+  try{
+    r = await api("/api/update/apply", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"
+    });
+  }catch(e){
+    r = {ok: false, error: (e.message || String(e))};
+  }
+  if(!r || !r.ok){
+    $("ubIco").textContent = "⚠️";
+    $("ubMsg").textContent = "更新失败：" + ((r && r.error) || "未知错误");
+    $("ubGo").disabled = false;
+    $("ubGo").textContent = "重试";
+    $("ubProg").hidden = true;
+    return;
+  }
+  updatePoll();
+}
+function updatePoll(){
+  _updStopPoll();
+  UPD.polling = setInterval(async ()=>{
+    let p = null;
+    try{ p = await api("/api/update/progress"); }catch(e){ return; }
+    if(!p || !p.stage) return;
+    const st = p.stage;
+    if(st === "downloading" || st === "extracting" || st === "backing_up"){
+      $("ubProg").hidden = false;
+      let pct = p.percent || 0;
+      if(st === "extracting") pct = Math.max(pct, 96);
+      if(st === "backing_up") pct = Math.max(pct, 99);
+      $("ubFill").style.width = pct + "%";
+      $("ubMsg").textContent = p.message || "正在更新…";
+      $("ubGo").disabled = true;
+    } else if(st === "ready"){
+      _updStopPoll();
+      $("ubIco").textContent = "✅";
+      $("ubMsg").textContent = "下载完成，点击「重启并更新」";
+      $("ubFill").style.width = "100%";
+      $("ubGo").disabled = false;
+      $("ubGo").textContent = "重启并更新";
+      $("ubLater").hidden = false;
+      UPD.ready = true;
+    } else if(st === "error"){
+      _updStopPoll();
+      $("ubIco").textContent = "⚠️";
+      $("ubMsg").textContent = "更新失败：" + (p.error || "未知错误");
+      $("ubProg").hidden = true;
+      $("ubGo").disabled = false;
+      $("ubGo").textContent = "重试";
+      $("ubManual").hidden = false;
+      $("ubLater").hidden = false;
+      UPD.ready = false;
+    } else if(st === "applying"){
+      $("ubMsg").textContent = p.message || "正在重启…";
+      $("ubGo").disabled = true;
+    }
+  }, 700);
+}
+async function updateRestart(){
+  $("ubGo").disabled = true;
+  $("ubMsg").textContent = "正在重启并替换文件，请稍候…";
+  try{
+    const r = await api("/api/update/restart", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"
+    });
+    if(!r || !r.ok){
+      $("ubMsg").textContent = "重启失败：" + ((r && r.error) || "未知错误");
+      $("ubGo").disabled = false;
+    }
+  }catch(e){
+    // 进程退出时请求会中断，属正常
+  }
+}
+
 try{
   const tag = $("verTag");
   if(tag) tag.onclick = ()=>checkUpdate(true, false);
   const go = $("ubGo");
-  if(go) go.onclick = ()=>{
-    const u = (UPD.data && UPD.data.url) ||
+  if(go) go.onclick = ()=> UPD.ready ? updateRestart() : updateStart();
+  const man = $("ubManual");
+  if(man) man.onclick = ()=>{
+    const u = (UPD.data && (UPD.data.asset_url || UPD.data.url)) ||
       "https://github.com/ainghhh/Gallery-For-StableDiffusion/releases";
-    // 交给后端用系统浏览器打开（WebView2 里 window.open 不可靠）
     api("/api/open-url?url=" + encodeURIComponent(u)).then(r=>{
       if(!r || !r.ok) showToast("请手动打开：" + u);
     }).catch(()=>showToast("请手动打开：" + u));
@@ -4479,13 +4603,13 @@ try{
   const later = $("ubLater");
   if(later) later.onclick = ()=>{
     if(UPD.data && UPD.data.latest) _ls(UPD.skipKey, UPD.data.latest);
-    const b = $("updateBar"); if(b) b.hidden = true;
+    _updStopPoll();
+    const b = _ub(); if(b) b.hidden = true;
   };
   // 启动 4 秒后再检查（完全不阻塞主流程）
   setTimeout(()=>{
     const last = parseInt(_ls(UPD.atKey) || "0", 10) || 0;
     const fresh = Date.now() - last > 24 * 3600 * 1000;
-    // 24 小时内：只把版本号显示出来，不再弹提示条打扰
     checkUpdate(false, !fresh);
   }, 4000);
 }catch(e){}
