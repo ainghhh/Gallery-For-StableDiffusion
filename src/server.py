@@ -946,66 +946,102 @@ def _backup_userdata(old_ver, new_ver):
     return out
 
 
-def _build_updater_bat(app_dir, stage, new_ver, pid):
-    r"""生成替换脚本。
+def _powershell_exe():
+    """找 powershell.exe（优先完整路径）。"""
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    p = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    if os.path.isfile(p):
+        return p
+    return "powershell"
 
-    踩过的坑：
-      · `timeout /t 1` 在 DETACHED_PROCESS（无控制台）下会立刻失败 →
-        等待循环变成忙循环。改用 `ping -n 2 127.0.0.1 >nul` 做延时。
-      · `tasklist | find <进程名>` 不够可靠；改成按 **PID** 判存活。
-      · 路径含空格时 `cmd /c "C:\a b\x.bat"` 可能被拆错；
-        所以脚本用**相对文件名**启动（cwd 已经是 app_dir）。
-      · 批处理里满是 %date% / %time% / %ERRORLEVEL%，
-        **不能用 Python 的 % 格式化**（%d 会被当占位符），
-        统一改用 str.format（模板里没有花括号）。
-      · 万一等不到退出，90 秒后**放弃替换**并把旧版拉起来，绝不留下半装状态。
+
+def _build_updater_ps1(app_dir, stage, new_ver, pid):
+    r"""生成替换脚本（PowerShell 版）。
+
+    为什么不批处理：
+      · `tasklist` 在无控制台（DETACHED）下会挂死，等待循环永远不退出
+      · 批处理里 `%date%` / `%time%` 还会跟 Python 的 % 格式化打架
+    PowerShell 的 Get-Process 不依赖控制台，稳定得多。
+
+    安全边界：
+      · 只替换 Gallery4ComfyUI.exe / app.ico / _internal/
+      · config.json 用点名复制，绝不被更新包里的空模板覆盖
+      · data/ 只做「新增+覆盖」（/E），**从不删除**用户的自定义画师库
+      · userdata/（收藏）、backups/ 一条命令都不碰
+      · 等不到进程退出（90 秒）就**放弃替换**并拉回旧版，绝不留下半装状态
     """
     src = os.path.join(stage, "Gallery4ComfyUI")
     exe_name = "Gallery4ComfyUI.exe"
-    log_name = "_update_run.log"
+    ps1_path = os.path.join(app_dir, "_apply_update.ps1")
 
-    def F(tpl):
-        return tpl.format(pid=pid, log=log_name, src=src,
-                          exe=exe_name, stage=stage)
+    L = r"""$ErrorActionPreference = 'Continue'
+$app = $PSScriptRoot
+$log = Join-Path $app '_update_run.log'
+function L($m) {
+    try { Add-Content -Path $log -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) -Encoding utf8 } catch {}
+}
+$targetPid = __PID__
+$src       = '__SRC__'
+$exe       = Join-Path $app '__EXE__'
+$stage     = '__STAGE__'
 
-    L = [
-        "@echo off",
-        "setlocal enabledelayedexpansion",
-        "chcp 65001 >nul 2>&1",
-        'cd /d "%~dp0"',
-        "set TRIES=0",
-        F('echo [%date% %time%] updater start (pid={pid})>>"{log}"'),
-        ":wait",
-        F('tasklist /NH /FI "PID eq {pid}" 2>nul | findstr /C:"{pid}" >nul'),
-        "if errorlevel 1 goto repl",
-        "set /a TRIES+=1",
-        "if %TRIES% geq 90 goto toolong",
-        "ping -n 2 127.0.0.1 >nul 2>&1",
-        "goto wait",
-        ":toolong",
-        F('echo [%date% %time%] TIMEOUT waiting pid {pid}, abort and keep old version>>"{log}"'),
-        F('start "" "{exe}"'),
-        "goto end",
-        ":repl",
-        F('echo [%date% %time%] app exited, replacing program files>>"{log}"'),
-        F('robocopy "{src}\\_internal" "_internal" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP'),
-        F('if errorlevel 8 echo [%date% %time%] WARN robocopy _internal errorlevel=%ERRORLEVEL%>>"{log}"'),
-        # 只点名两个文件 → config.json 绝不会被更新包里的空模板覆盖
-        F('robocopy "{src}" "." {exe} app.ico /R:3 /W:1 /NFL /NDL /NJH /NJS /NP'),
-        F('if errorlevel 8 echo [%date% %time%] WARN robocopy exe errorlevel=%ERRORLEVEL%>>"{log}"'),
-        # data 只增不删：用户的自定义画师库必须留着
-        F('if exist "{src}\\data" robocopy "{src}\\data" "data" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP'),
-        F('echo [%date% %time%] starting new version>>"{log}"'),
-        F('start "" "{exe}"'),
-        F('rmdir /s /q "{stage}" 2>nul'),
-        ":end",
-        F('echo [%date% %time%] updater done>>"{log}"'),
-        'del "%~f0"',
-    ]
-    bat = os.path.join(app_dir, "_apply_update.bat")
-    with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
-        f.write("\n".join(L) + "\n")
-    return bat
+L "updater start (waiting pid=$targetPid)"
+
+# ---- 1) 等旧进程退出（最多 90 秒）----
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 400
+}
+if (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) {
+    L "TIMEOUT waiting for process, abort and keep OLD version"
+    try { Start-Process -FilePath $exe } catch {}
+    exit 1
+}
+L "app exited, replacing program files"
+
+# ---- 2) 替换 _internal（程序目录，可以镜像）----
+& robocopy "$src\_internal" "$app\_internal" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+$rc1 = $LASTEXITCODE
+L "robocopy _internal exit=$rc1"
+
+# ---- 3) 只点名 exe / ico：config.json 绝不会被覆盖 ----
+& robocopy $src $app '__EXE__' app.ico /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+$rc2 = $LASTEXITCODE
+L "robocopy exe exit=$rc2"
+
+# ---- 4) data 只增不删（保留用户的自定义画师库）----
+if (Test-Path "$src\data") {
+    & robocopy "$src\data" "$app\data" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    $rc3 = $LASTEXITCODE
+    L "robocopy data exit=$rc3"
+}
+
+if ($rc1 -ge 8 -or $rc2 -ge 8) {
+    L "ERROR copy failed, restart OLD version"
+    try { Start-Process -FilePath $exe } catch {}
+    exit 1
+}
+
+# ---- 5) 启动新版 + 清理 ----
+L "starting new version __VER__"
+Start-Sleep -Milliseconds 400
+try { Start-Process -FilePath $exe } catch { L "ERROR start failed: $_" }
+Start-Sleep -Seconds 2
+try { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+L "updater done"
+try { Remove-Item $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
+"""
+
+    L = (L.replace("__PID__", str(int(pid)))
+          .replace("__SRC__", src)
+          .replace("__EXE__", exe_name)
+          .replace("__STAGE__", stage)
+          .replace("__VER__", str(new_ver or "")))
+    # utf-8-sig：PowerShell 5.1 读无 BOM 的 UTF-8 会按 ANSI 解
+    with open(ps1_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+        f.write(L)
+    return ps1_path
 
 
 def _do_update(url, new_ver, old_ver, expect_size=0):
@@ -1117,16 +1153,19 @@ async def api_update_restart(request):
             return _json({"ok": False, "error": "更新包还没准备好"})
         app_dir = APP_DIR
         exe = os.path.join(app_dir, "Gallery4ComfyUI.exe")
-        bat = _build_updater_bat(app_dir, _UPDATE_STAGING,
+        ps1 = _build_updater_ps1(app_dir, _UPDATE_STAGING,
                                  _UP.get("version", ""), os.getpid())
         _up_set(stage="applying", percent=100, message="正在重启并替换文件…")
-        log("开始应用更新：%s" % bat)
-        # 用**相对文件名** + cwd=app_dir 启动：路径含空格也不会被 cmd 拆错。
-        # DETACHED_PROCESS：批处理不随本进程一起被结束。
-        subprocess.Popen(["cmd", "/c", os.path.basename(bat)], cwd=app_dir,
-                         creationflags=0x00000008,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, close_fds=True)
+        log("开始应用更新：%s" % ps1)
+        # 千万不要用 DETACHED_PROCESS(0x8)：实测会让子进程直接不干活。
+        # 用 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP：无窗口、且独立于本进程。
+        subprocess.Popen(
+            [_powershell_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-WindowStyle", "Hidden", "-File", ps1],
+            cwd=app_dir,
+            creationflags=0x08000000 | 0x00000200,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, close_fds=True)
         threading.Timer(0.8, lambda: os._exit(0)).start()
         return _json({"ok": True})
     except Exception as e:
