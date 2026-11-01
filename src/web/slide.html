@@ -83,9 +83,12 @@
   /* ⚠️ 这里原来写的是 `#stage.hideui #bar` —— 但 #bar 和 #stage 是**兄弟节点**，
      不是父子，那条选择器永远匹配不上，所以"自动隐藏"从来没生效过。
      改成同时挂在 body 上（见 slide.js 的 setHideUI），用兄弟/后代表达式都行。 */
+  /* 隐藏时**整体移出屏幕**，而不是留在原地只变透明：
+     留在原地时虽然 pointer-events:none，但用户点上去会穿透到画面上，
+     表现为"点顶栏没反应"（甚至误触切图）。移出屏幕后就不会再误导。 */
   body.hideui #top {
     opacity:0; pointer-events:none;
-    transform:translateX(-50%) translateY(-10px);
+    transform:translateX(-50%) translateY(-140%);
   }
   /* body.hideui #bar 见文件末尾动效层（统一管理） */
   #stage.hideui { cursor:none; }
@@ -195,6 +198,9 @@
   .meter-thresh {
     position:absolute; top:-2px; bottom:-2px; width:2px;
     background:#ffce4a; box-shadow:0 0 6px #ffce4a;
+    /* translateX(-50%) 让竖线以 left 指定位置为中心，
+       配合 JS 把 left 夹到 1..99%，两端都不会被 overflow:hidden 裁掉 */
+    transform: translateX(-50%);
     transition: left .08s linear;
   }
   /* 固定阈值用另一个颜色，一眼能看出当前是哪种判定 */
@@ -243,7 +249,7 @@
   }
   body.hideui #bar {
     opacity: 0 !important; pointer-events: none;
-    transform: translateX(-50%) translateY(14px) scale(.97) !important;
+    transform: translateX(-50%) translateY(160%) scale(.97) !important;
   }
 
   /* 每一拍：整条轻微"呼吸"一下 —— 幅度很小，但能感觉到音乐在动 */

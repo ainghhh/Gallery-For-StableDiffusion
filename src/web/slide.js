@@ -465,8 +465,17 @@
     // 后端给的是 dB（-60..0 归一到 0..100%）
     const ldb = audio.levelDb != null ? audio.levelDb : -60;
     const td = audio.threshDb != null ? audio.threshDb : -60;
-    const pct = Math.max(0, Math.min(100, ((ldb + 60) / 60) * 100));
-    const tpc = Math.max(0, Math.min(100, ((td + 60) / 60) * 100));
+    // 电平表量程要跟着**当前阈值模式**走，否则滑块拉到头也对不上表的右边缘：
+    //   固定模式滑块是 -60..-3 dB → 表也用 -60..-3，拉满正好到 100%
+    //   动态模式阈值是"基线 + 需求"，可能到 0 dB 以上 → 表用 -60..0
+    const fixedMode = (S.thrMode || "dynamic") === "fixed";
+    const hiDb = fixedMode ? -3 : 0;
+    const span = Math.max(1, hiDb + 60);
+    const pct = Math.max(0, Math.min(100, ((ldb + 60) / span) * 100));
+    // 门槛线宽 2px，left:100% 会被 .meter 的 overflow:hidden 整个裁掉，
+    // 表现为"拉到最右竖线就消失了"。夹到 1..99%，再靠 translateX(-50%) 居中，
+    // 这样 0% 和 100% 两端都能看见。
+    const tpc = Math.max(1, Math.min(99, ((td + 60) / span) * 100));
     lvl.style.width = pct + "%";
     th.style.left = tpc + "%";
     // 电平撞过阈值线时高亮一下，一眼看出"这一下会切图"
@@ -720,14 +729,22 @@
 
   function fmtDb(v) { return (v > 0 ? "+" : "") + Number(v).toFixed(1); }
 
-  /** 滑块已填充部分的比例（给 CSS 的 --fill 用，做出"进度条"手感）。 */
-  function syncSliderFill() {
-    const sl = $("aSens");
+  /** 把一个 range 的已填充比例写进 CSS 变量 --fill（做出"进度条"手感）。 */
+  function fillOne(sl) {
     if (!sl) return;
     const mn = parseFloat(sl.min), mx = parseFloat(sl.max);
     const v = parseFloat(sl.value);
     const pct = (mx > mn) ? ((v - mn) / (mx - mn)) * 100 : 0;
     sl.style.setProperty("--fill", Math.max(0, Math.min(100, pct)).toFixed(1) + "%");
+  }
+  /**
+   * 同步所有 range 的填充。
+   * 之前只同步 #aSens，速度滑块 #rngFps 从来没设过 --fill，
+   * 于是一直用 CSS 里的默认 10%，不管怎么拖都是那一段 —— 看着像"没有对应位置"。
+   */
+  function syncSliderFill() {
+    fillOne($("aSens"));
+    fillOne($("rngFps"));
   }
 
   /** 一拍点亮：整条播放条轻微呼吸 + 电平表发光。 */
@@ -797,6 +814,7 @@
       if (S.sMode === "fps") { S.fps = Math.min(60, v); save("fps", S.fps); }
       else if (S.sMode === "spf") { S.spf = Math.min(60, v); save("spf", S.spf); }
       applySpeedUI();
+      fillOne(el);
     });
   }
   bindSpeedInput($("numFps"));
@@ -846,6 +864,12 @@
   function blurSelf(e) {
     const t = e.target;
     if (!t || !t.blur) return;
+    const tag = (t.tagName || "").toLowerCase();
+    // ⚠️ <select> 绝对不能 blur！
+    //    Windows 下原生下拉是"聚焦即弹出"，这里 0ms 后一 blur，
+    //    弹层立刻被关掉 —— 用户看到的就是"点了没反应、选不了"（实测）。
+    //    方向键换项的问题由下面的 keydown 拦截解决，不需要靠 blur。
+    if (tag === "select") return;
     // 数值/区间输入要给用户留出连续调整的时间，不立即 blur
     if (t.id === "numFps" || t.id === "rngFps" || t.id === "advThr") {
       setTimeout(() => { if (document.activeElement === t) t.blur(); }, 1200);
@@ -933,14 +957,25 @@
     $("stage").classList.remove("hideui");
     clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {
+      // 鼠标停在顶栏/播放条上时不要隐藏（否则用户正要点的按钮会缩走）
+      if (hoverUI) return;
       if (S.playing) {
         document.body.classList.add("hideui");
         $("stage").classList.add("hideui");   // 同时保留：用来隐藏鼠标指针
       }
-    }, 2000);
+    }, 2600);
   }
-  document.addEventListener("mousemove", showUI);
-  document.addEventListener("mousedown", showUI);
+  // 鼠标是否停在顶栏/播放条上
+  let hoverUI = false;
+  [["top", true], ["bar", true]].forEach(([id]) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("mouseenter", () => { hoverUI = true; showUI(); });
+    el.addEventListener("mouseleave", () => { hoverUI = false; showUI(); });
+  });
+  // 任何指针/键盘活动都算"有活动"
+  ["pointermove", "pointerdown", "mousedown", "wheel", "touchstart"].forEach(ev =>
+    document.addEventListener(ev, showUI, { passive: true }));
   // 键盘操作也算"有活动"，别一边按键一边黑着
   document.addEventListener("keydown", showUI);
   // 鼠标移出窗口 / 触摸屏：直接进隐藏态，不用等 2 秒

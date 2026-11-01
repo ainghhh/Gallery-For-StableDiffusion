@@ -753,6 +753,7 @@
   <span class="ub-ico" id="ubIco">🆕</span>
   <span class="ub-txt" id="ubMsg">发现新版本 <b id="ubVer">—</b></span>
   <div class="ub-prog" id="ubProg" hidden><div class="ub-fill" id="ubFill"></div></div>
+  <button class="ub-link" id="ubRollback" title="回到上一版（更新前自动保留的）" hidden>回滚</button>
   <button class="ub-link" id="ubManual" title="用浏览器手动下载">手动下载</button>
   <button class="ub-go" id="ubGo">立即更新</button>
   <button class="ub-later" id="ubLater">稍后</button>
@@ -4432,6 +4433,7 @@ const UPD = {
   data: null,
   polling: null,
   ready: false,
+  canRollback: false,
 };
 function _ls(k, v){
   try{
@@ -4450,6 +4452,7 @@ function _ubReset(){
   $("ubGo").disabled = false;
   $("ubManual").hidden = false;
   $("ubLater").hidden = false;
+  if ($("ubRollback")) $("ubRollback").hidden = !UPD.canRollback;
   UPD.ready = false;
 }
 function _showUpdateBar(d){
@@ -4606,6 +4609,45 @@ try{
     _updStopPoll();
     const b = _ub(); if(b) b.hidden = true;
   };
+  // 回滚：把更新前自动留下的 exe 换回来
+  const rb = $("ubRollback");
+  if (rb) rb.onclick = async ()=>{
+    rb.disabled = true;
+    $("ubMsg").textContent = "正在回滚到上一版…";
+    try {
+      const r = await api("/api/update/rollback", {
+        method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"
+      });
+      if (!r || !r.ok) {
+        $("ubMsg").textContent = "回滚失败：" + ((r && r.error) || "未知错误");
+        rb.disabled = false;
+      }
+    } catch (e) {
+      // 进程退出时请求会断，属正常
+    }
+  };
+
+  // 启动 3 秒后读一次诊断：拿到 just_updated / can_rollback
+  setTimeout(async ()=>{
+    let d = null;
+    try { d = await api("/api/diag"); } catch(e) {}
+    if (!d) return;
+    // ① 刚更新过 → 提示一次
+    const ju = d.just_updated;
+    if (ju && ju.to) {
+      if (_ls("gal4c_updated_to") !== ju.to) {
+        _ls("gal4c_updated_to", ju.to);
+        showToast("✅ 已更新到 v" + ju.to + "（上一版 v" + ju.from + "）");
+      }
+    }
+    // ② 留了旧版：更新失败时给个回滚入口
+    if (d.can_rollback) {
+      UPD.canRollback = true;
+      const b = $("ubRollback");
+      if (b) b.hidden = false;
+    }
+  }, 3000);
+
   // 启动 4 秒后再检查（完全不阻塞主流程）
   setTimeout(()=>{
     const last = parseInt(_ls(UPD.atKey) || "0", 10) || 0;

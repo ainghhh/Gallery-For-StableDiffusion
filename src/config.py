@@ -23,7 +23,7 @@ def _app_dir():
 
 
 # 程序版本（更新检查用；发版时改这里，前端版本标签也读它）
-VERSION = "1.3.15"
+VERSION = "1.3.16"
 
 APP_DIR = _app_dir()
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")

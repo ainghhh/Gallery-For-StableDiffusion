@@ -55,7 +55,98 @@ def _fatal(title, detail):
         pass
 
 
+def _msgbox(text, title="Gallery4ComfyUI"):
+    """原生消息框（不依赖 webview / tkinter）。"""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, text, title, 0x40)
+    except Exception:
+        try:
+            print(text)
+        except Exception:
+            pass
+
+
+def activate_existing_window(title_part="Gallery"):
+    """把已有的窗口提到前台。找不到就返回 False。
+
+    为什么不用消息框：模态框要用户点"确定"才消失，双击图标启动时
+    会莫名其妙停在对话框上；直接切到旧窗口才是正常软件的行为。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        found = []
+        EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            try:
+                if not u32.IsWindowVisible(hwnd):
+                    return True
+                n = u32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u32.GetWindowTextW(hwnd, buf, n + 1)
+                if title_part.lower() in buf.value.lower():
+                    found.append(hwnd)
+                    return False
+            except Exception:
+                pass
+            return True
+
+        u32.EnumWindows(EnumProc(_cb), 0)
+        if not found:
+            return False
+        hwnd = found[0]
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)          # SW_RESTORE
+        u32.SetForegroundWindow(hwnd)
+        u32.BringWindowToTop(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def acquire_single_instance():
+    """命名互斥体：保证同时只有一个实例在跑。
+
+    为什么必须做：
+      pywebview 的 WebView2 用同一个用户数据目录（userdata/webview），
+      两个进程同时用它 → 后启动的窗口会渲染但**点不动**（假死），
+      而且端口会被顶到下一个数字，origin 一变设置就"消失"。
+
+    返回 (ok, handle)：
+      ok=False 表示已有实例在跑，调用方应该提示后退出。
+      handle 必须活到进程结束（不要丢引用），否则互斥体会被释放。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        h = k32.CreateMutexW(None, wintypes.BOOL(True),
+                             ctypes.c_wchar_p("Global\\Gallery4ComfyUI_SingleInstance"))
+        ERR_ALREADY_EXISTS = 183
+        if k32.GetLastError() == ERR_ALREADY_EXISTS:
+            return False, h
+        return True, h
+    except Exception:
+        # 拿不到互斥体（非 Windows / 权限问题）时不阻断启动
+        return True, None
+
+
 def main():
+
+    # ---- 单实例：两个实例会抢同一个 WebView2 目录，窗口会假死 ----
+    _ok, _mutex = acquire_single_instance()
+    if not _ok:
+        # 优先把已有窗口提到前台；只有找不到窗口时才提示（极少数情况）
+        if not activate_existing_window("Gallery"):
+            _msgbox("Gallery4ComfyUI 已经在运行了。\n\n"
+                    "请切换到已打开的窗口；如果要重启，请先把它关掉。")
+        return 0
     log("=" * 62)
     log(f"启动 frozen={bool(getattr(sys,'frozen',False))} python={sys.version.split()[0]}")
 

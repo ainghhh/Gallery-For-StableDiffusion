@@ -24,6 +24,32 @@ import config as CFG
 APP_DIR = CFG.APP_DIR
 _cfg = CFG.load()
 
+
+def _track_version():
+    """记录 last_version；版本变了就标记 just_updated，前端好提示一次。
+
+    只在"曾经记录过旧版本"时才提示 —— 第一次安装不该弹"已更新"。
+    """
+    try:
+        cur = getattr(CFG, "VERSION", "")
+        prev = str(_cfg.get("last_version") or "")
+        if prev and cur and prev != cur:
+            _cfg["just_updated"] = {"from": prev, "to": cur}
+        elif _cfg.get("just_updated"):
+            _cfg.pop("just_updated", None)
+        if cur and prev != cur:
+            cfg2 = CFG.load()
+            cfg2["last_version"] = cur
+            if _cfg.get("just_updated"):
+                cfg2["just_updated"] = _cfg["just_updated"]
+            CFG.save(cfg2)
+            _cfg["last_version"] = cur
+    except Exception:
+        pass
+
+
+_track_version()
+
 # gallery_core 的目录约定（必须在 import 之前设好）
 os.environ["GALLERY4_USERDATA"] = os.path.join(APP_DIR, "userdata")
 if _cfg.get("data_dir"):
@@ -177,6 +203,32 @@ def _port_usable(p):
         return True
     except OSError:
         return False
+
+
+_PORT_WAIT_S = 8.0
+
+
+def wait_port(preferred, timeout=_PORT_WAIT_S):
+    """等首选端口空出来。
+
+    场景：刚点了「重启并更新」，旧进程还在退出中，端口还没释放。
+    这时如果立刻换端口，origin 就变了 —— 用户的 localStorage 设置会"消失"。
+    所以先等一会儿，通常 1~2 秒内就好了。
+    """
+    import time as _t
+    try:
+        preferred = int(preferred or 0)
+    except Exception:
+        return False
+    if not preferred:
+        return False
+    t0 = _t.time()
+    while True:
+        if _port_usable(preferred):
+            return True
+        if (_t.time() - t0) >= timeout:
+            return False
+        _t.sleep(0.25)
 
 
 def pick_stable_port(preferred=0):
@@ -759,6 +811,119 @@ async def api_audio_stream(request):
 
 
 # ---------------------------------------------------------------------------
+# 更新用的网络工具：代理 + 重试
+#
+# 为什么值得单独做：国内直连 GitHub 经常是"能连通但很慢/随机断"，
+# 一次超时就判失败会让用户永远看不到更新。所以：
+#   · 优先用 config.json 里的 update_proxy（如 http://127.0.0.1:7890）
+#   · 没有就读 Windows 系统代理（注册表 Internet Settings）
+#   · 每个请求最多试 3 次
+# ---------------------------------------------------------------------------
+def _system_proxy():
+    """读 Windows 系统代理（IE/设置里那个）。没有就返回 None。"""
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        try:
+            enabled, _ = winreg.QueryValueEx(k, "ProxyEnable")
+        except Exception:
+            enabled = 0
+        try:
+            server, _ = winreg.QueryValueEx(k, "ProxyServer")
+        except Exception:
+            server = ""
+        winreg.CloseKey(k)
+        if not enabled or not server:
+            return None
+        # ProxyServer 可能是 "host:port" 或 "http=host:port;https=host:port"
+        srv = str(server)
+        if "=" in srv:
+            parts = dict(p.split("=", 1) for p in srv.split(";") if "=" in p)
+            srv = parts.get("https") or parts.get("http") or ""
+        srv = srv.strip()
+        if not srv:
+            return None
+        return srv if "://" in srv else "http://" + srv
+    except Exception:
+        return None
+
+
+def _update_proxy():
+    """本次更新该用的代理：配置优先，其次系统代理。"""
+    p = str(_cfg.get("update_proxy") or "").strip()
+    if p:
+        return p if "://" in p else "http://" + p
+    return _system_proxy()
+
+
+def _http_open(url, headers=None, timeout=15, tries=3, on_chunk=None):
+    """GET 一个 URL，带代理与重试。返回 (bytes, headers)。
+
+    on_chunk(bytes_so_far, total) 用于下载进度；不传就一次性读完。
+    """
+    import time as _t
+    import urllib.request as _u
+    proxy = _update_proxy()
+    handlers = []
+    if proxy:
+        handlers.append(_u.ProxyHandler({"http": proxy, "https": proxy}))
+    else:
+        handlers.append(_u.ProxyHandler({}))
+    opener = _u.build_opener(*handlers)
+    hdrs = {"User-Agent": "Gallery4ComfyUI", "Accept": "*/*"}
+    hdrs.update(headers or {})
+
+    last = None
+    for attempt in range(tries):
+        try:
+            req = _u.Request(url, headers=hdrs)
+            with opener.open(req, timeout=timeout) as r:
+                total = 0
+                try:
+                    total = int(r.headers.get("Content-Length") or 0)
+                except Exception:
+                    pass
+                if on_chunk is None:
+                    data = r.read()
+                    return data, dict(r.headers)
+                buf = bytearray()
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    try:
+                        on_chunk(len(buf), total)
+                    except Exception:
+                        pass
+                return bytes(buf), dict(r.headers)
+        except Exception as e:
+            last = e
+            if attempt < tries - 1:
+                _t.sleep(1.5 * (attempt + 1))
+    raise last
+
+
+def _prune_backups(keep=3):
+    """backups/ 只留最近 keep 份 pre_update_*，别越攒越多。"""
+    try:
+        bdir = os.path.join(APP_DIR, "backups")
+        if not os.path.isdir(bdir):
+            return
+        files = [f for f in os.listdir(bdir)
+                 if f.startswith("pre_update_") and f.lower().endswith(".zip")]
+        files.sort(key=lambda f: os.path.getmtime(os.path.join(bdir, f)), reverse=True)
+        for f in files[keep:]:
+            try:
+                os.remove(os.path.join(bdir, f))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # 更新检查（GitHub Releases）
 #
 # 设计要求：**绝不能影响主功能**
@@ -798,14 +963,27 @@ async def api_update_check(request):
            "url": "https://github.com/%s/releases" % _GITHUB_REPO,
            "notes": "", "published_at": "", "error": "", "cached": False}
     try:
-        import urllib.request
-        req = urllib.request.Request(
-            "https://api.github.com/repos/%s/releases/latest" % _GITHUB_REPO,
-            headers={"Accept": "application/vnd.github+json",
-                     "User-Agent": "Gallery4ComfyUI-UpdateCheck"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            raw = r.read().decode("utf-8", "replace")
-        j = json.loads(raw)
+        gh_headers = {"Accept": "application/vnd.github+json",
+                      "User-Agent": "Gallery4ComfyUI-UpdateCheck"}
+        j = None
+        try:
+            raw, _h = _http_open(
+                "https://api.github.com/repos/%s/releases/latest" % _GITHUB_REPO,
+                headers=gh_headers, timeout=12, tries=3)
+            j = json.loads(raw.decode("utf-8", "replace"))
+        except Exception as e1:
+            # 仓库里只有预发布版时 /latest 会 404 —— 回退到列表里挑最新的正式版
+            if "404" not in str(e1):
+                raise
+            raw, _h = _http_open(
+                "https://api.github.com/repos/%s/releases?per_page=10" % _GITHUB_REPO,
+                headers=gh_headers, timeout=12, tries=3)
+            arr = json.loads(raw.decode("utf-8", "replace"))
+            cand = [x for x in (arr or [])
+                    if isinstance(x, dict) and not x.get("draft") and not x.get("prerelease")]
+            if not cand:
+                raise ValueError("没有找到正式发布版本")
+            j = cand[0]
         if not isinstance(j, dict):
             raise ValueError("GitHub 返回的不是 JSON 对象")
         latest = str(j.get("tag_name") or "").strip()
@@ -840,7 +1018,9 @@ async def api_update_check(request):
         elif "timed out" in low or "timeout" in low:
             out["error"] = "网络超时"
         elif "urlopen error" in low or "getaddrinfo" in low or "connection" in low:
-            out["error"] = "连不上 GitHub（网络或代理问题）"
+            px = _update_proxy()
+            out["error"] = ("连不上 GitHub（网络或代理问题）"
+                            + ("；当前代理：" + px if px else "；没检测到系统代理，可在 config.json 里设 update_proxy"))
         elif "404" in msg:
             out["error"] = "仓库或 Release 不存在"
         else:
@@ -1000,6 +1180,12 @@ if (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) {
 }
 L "app exited, replacing program files"
 
+# ---- 1.5) 先把旧 exe 存一份，出问题可以一键回滚 ----
+try {
+    if (Test-Path $exe) { Copy-Item $exe ($exe + '.old') -Force }
+    L "old exe saved as .old"
+} catch { L "WARN could not backup old exe: $_" }
+
 # ---- 2) 替换 _internal（程序目录，可以镜像）----
 & robocopy "$src\_internal" "$app\_internal" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
 $rc1 = $LASTEXITCODE
@@ -1058,24 +1244,19 @@ def _do_update(url, new_ver, old_ver, expect_size=0):
 
         _up_set(stage="downloading", percent=0, message="正在下载更新包…", error="")
         dl = os.path.join(stage_dir, "download.zip")
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Gallery4ComfyUI-Updater", "Accept": "*/*"})
-        total = expect_size or 0
-        got = 0
-        with urllib.request.urlopen(req, timeout=60) as r, open(dl, "wb") as f:
-            try:
-                total = int(r.headers.get("Content-Length") or total or 0)
-            except Exception:
-                pass
-            while True:
-                chunk = r.read(256 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                got += len(chunk)
-                if total:
-                    _up_set(percent=min(99, int(got * 100 / total)),
-                            message="正在下载… %d%%" % int(got * 100 / total))
+
+        def _prog(sofar, total):
+            if total:
+                pct = min(99, int(sofar * 100 / total))
+                _up_set(percent=pct, message="正在下载… %d%%" % pct)
+            else:
+                _up_set(percent=min(95, sofar // (400 * 1024)),
+                        message="正在下载… %.1f MB" % (sofar / 1048576.0))
+
+        data, _hdrs = _http_open(url, timeout=60, tries=3, on_chunk=_prog)
+        with open(dl, "wb") as f:
+            f.write(data)
+        got = len(data)
         if got < 1024:
             raise ValueError("下载内容过小（%d 字节），可能网络异常" % got)
         if expect_size and got != expect_size:
@@ -1102,6 +1283,7 @@ def _do_update(url, new_ver, old_ver, expect_size=0):
 
         _up_set(stage="backing_up", percent=0, message="正在备份你的收藏和配置…")
         bk = _backup_userdata(old_ver, new_ver)
+        _prune_backups(3)
 
         _up_set(stage="ready", percent=100,
                 message="更新包已就绪，点击「重启并更新」完成",
@@ -1144,6 +1326,53 @@ async def api_update_apply(request):
 async def api_update_progress(request):
     with _UP_LOCK:
         return _json(dict(_UP))
+
+
+async def api_update_rollback(request):
+    """把 Gallery4ComfyUI.exe.old 换回来并重启。
+
+    用在哪里：新版万一有问题（比如启动就崩），用户还能回到上一版。
+    旧 exe 是更新时自动留下的；_internal 不回滚（换回去一般也够用）。
+    """
+    try:
+        old = os.path.join(APP_DIR, "Gallery4ComfyUI.exe.old")
+        if not os.path.isfile(old):
+            return _json({"ok": False, "error": "没有可回滚的旧版本"})
+        ps1 = os.path.join(APP_DIR, "_rollback.ps1")
+        exe_name = "Gallery4ComfyUI.exe"
+        L = r"""$ErrorActionPreference = 'Continue'
+$app = $PSScriptRoot
+$log = Join-Path $app '_update_run.log'
+function L($m) { try { Add-Content -Path $log -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) -Encoding utf8 } catch {} }
+$pid0 = __PID__
+$exe  = Join-Path $app '__EXE__'
+$old  = $exe + '.old'
+L "rollback start (waiting pid=$pid0)"
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Id $pid0 -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 400
+}
+if (Get-Process -Id $pid0 -ErrorAction SilentlyContinue) { L "rollback TIMEOUT"; exit 1 }
+try { Copy-Item $old $exe -Force; L "rolled back exe" } catch { L "rollback copy failed: $_"; exit 1 }
+Start-Sleep -Milliseconds 400
+try { Start-Process -FilePath $exe } catch { L "rollback start failed: $_" }
+L "rollback done"
+try { Remove-Item $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
+""".replace("__PID__", str(os.getpid())).replace("__EXE__", exe_name)
+        with open(ps1, "w", encoding="utf-8-sig", newline="\r\n") as f:
+            f.write(L)
+        subprocess.Popen(
+            [_powershell_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-WindowStyle", "Hidden", "-File", ps1],
+            cwd=APP_DIR,
+            creationflags=0x08000000 | 0x00000200,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, close_fds=True)
+        threading.Timer(0.8, lambda: os._exit(0)).start()
+        return _json({"ok": True})
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)[:200]})
 
 
 async def api_update_restart(request):
@@ -1742,6 +1971,8 @@ def build_app():
             "artlib_installed": bool(getattr(G, "_data_file", lambda n: "")("artists.jsonl")),
             "frozen": bool(getattr(sys, "frozen", False)),
             "version": getattr(CFG, "VERSION", ""),
+            "just_updated": _cfg.get("just_updated") or None,
+            "can_rollback": os.path.isfile(os.path.join(APP_DIR, "Gallery4ComfyUI.exe.old")),
         })
 
     async def api_quit(request):
@@ -1754,6 +1985,7 @@ def build_app():
     app.router.add_post(P + "/api/update/apply", api_update_apply)
     app.router.add_get(P + "/api/update/progress", api_update_progress)
     app.router.add_post(P + "/api/update/restart", api_update_restart)
+    app.router.add_post(P + "/api/update/rollback", api_update_rollback)
     app.router.add_post(P + "/api/quit", api_quit)
     return app
 
@@ -1763,9 +1995,20 @@ def build_app():
 # ---------------------------------------------------------------------------
 class Server:
     def __init__(self, port=None):
-        # 稳定端口：优先沿用配置里的，否则从固定区间挑一个并记下来
-        self.port = pick_stable_port(_int(port) or _int(_cfg.get("port")))
-        persist_port(self.port)
+        # 稳定端口：优先沿用配置里的；被占用时**先等几秒**（旧实例可能正在退出），
+        # 真的等不到才换 —— 换端口等于换 localStorage 的 origin，代价很大。
+        _pref = _int(port) or _int(_cfg.get("port"))
+        if _pref and wait_port(_pref):
+            self.port = _pref
+            persist_port(self.port)
+        elif _pref:
+            self.port = pick_stable_port(0)
+            log(f"端口 {_pref} 等了 {_PORT_WAIT_S:.0f}s 仍被占用，"
+                f"改用 {self.port} 并记入配置（设置会从新端口重新开始）")
+            persist_port(self.port)
+        else:
+            self.port = pick_stable_port(0)
+            persist_port(self.port)
         self.loop = None
         self.runner = None
         self._thread = None
