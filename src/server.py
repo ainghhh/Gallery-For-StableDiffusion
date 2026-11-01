@@ -955,44 +955,51 @@ def _build_updater_bat(app_dir, stage, new_ver, pid):
       · `tasklist | find <进程名>` 不够可靠；改成按 **PID** 判存活。
       · 路径含空格时 `cmd /c "C:\a b\x.bat"` 可能被拆错；
         所以脚本用**相对文件名**启动（cwd 已经是 app_dir）。
-      · 万一等不到退出（例如被占用），60 秒后**放弃替换**并把旧版拉起来，
-        绝不留下装了一半的安装。
+      · 批处理里满是 %date% / %time% / %ERRORLEVEL%，
+        **不能用 Python 的 % 格式化**（%d 会被当占位符），
+        统一改用 str.format（模板里没有花括号）。
+      · 万一等不到退出，90 秒后**放弃替换**并把旧版拉起来，绝不留下半装状态。
     """
     src = os.path.join(stage, "Gallery4ComfyUI")
     exe_name = "Gallery4ComfyUI.exe"
     log_name = "_update_run.log"
+
+    def F(tpl):
+        return tpl.format(pid=pid, log=log_name, src=src,
+                          exe=exe_name, stage=stage)
+
     L = [
         "@echo off",
         "setlocal enabledelayedexpansion",
         "chcp 65001 >nul 2>&1",
-        "cd /d \"%~dp0\"",
+        'cd /d "%~dp0"',
         "set TRIES=0",
-        'echo [%date% %time%] updater start (pid=%s)>>"%s"' % (pid, log_name),
+        F('echo [%date% %time%] updater start (pid={pid})>>"{log}"'),
         ":wait",
-        'tasklist /NH /FI "PID eq %s" 2>nul | findstr /C:"%s" >nul' % (pid, pid),
+        F('tasklist /NH /FI "PID eq {pid}" 2>nul | findstr /C:"{pid}" >nul'),
         "if errorlevel 1 goto repl",
         "set /a TRIES+=1",
         "if %TRIES% geq 90 goto toolong",
         "ping -n 2 127.0.0.1 >nul 2>&1",
         "goto wait",
         ":toolong",
-        'echo [%date% %time%] TIMEOUT waiting for pid %s -> abort, keep old version>>"%s"' % (pid, log_name),
-        'start "" "%s"' % exe_name,
+        F('echo [%date% %time%] TIMEOUT waiting pid {pid}, abort and keep old version>>"{log}"'),
+        F('start "" "{exe}"'),
         "goto end",
         ":repl",
-        'echo [%date% %time%] app exited, replacing files>>"%s"' % log_name,
-        'robocopy "%s\\_internal" "_internal" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % src,
-        'if errorlevel 8 echo [%date% %time%] WARN robocopy _internal failed (%ERRORLEVEL%)>>"%s"' % log_name,
+        F('echo [%date% %time%] app exited, replacing program files>>"{log}"'),
+        F('robocopy "{src}\\_internal" "_internal" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP'),
+        F('if errorlevel 8 echo [%date% %time%] WARN robocopy _internal errorlevel=%ERRORLEVEL%>>"{log}"'),
         # 只点名两个文件 → config.json 绝不会被更新包里的空模板覆盖
-        'robocopy "%s" "." %s app.ico /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, exe_name),
-        'if errorlevel 8 echo [%date% %time%] WARN robocopy exe failed (%ERRORLEVEL%)>>"%s"' % log_name,
+        F('robocopy "{src}" "." {exe} app.ico /R:3 /W:1 /NFL /NDL /NJH /NJS /NP'),
+        F('if errorlevel 8 echo [%date% %time%] WARN robocopy exe errorlevel=%ERRORLEVEL%>>"{log}"'),
         # data 只增不删：用户的自定义画师库必须留着
-        'if exist "%s\\data" robocopy "%s\\data" "data" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, src),
-        'echo [%date% %time%] starting new version>>"%s"' % log_name,
-        'start "" "%s"' % exe_name,
-        'rmdir /s /q "%s" 2>nul' % stage,
+        F('if exist "{src}\\data" robocopy "{src}\\data" "data" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP'),
+        F('echo [%date% %time%] starting new version>>"{log}"'),
+        F('start "" "{exe}"'),
+        F('rmdir /s /q "{stage}" 2>nul'),
         ":end",
-        'echo [%date% %time%] updater done>>"%s"' % log_name,
+        F('echo [%date% %time%] updater done>>"{log}"'),
         'del "%~f0"',
     ]
     bat = os.path.join(app_dir, "_apply_update.bat")
