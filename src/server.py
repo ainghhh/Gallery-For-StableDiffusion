@@ -946,35 +946,56 @@ def _backup_userdata(old_ver, new_ver):
     return out
 
 
-def _build_updater_bat(app_dir, stage, new_ver):
-    """生成替换脚本。**只动程序文件**，用户数据一条命令都不碰。"""
+def _build_updater_bat(app_dir, stage, new_ver, pid):
+    r"""生成替换脚本。
+
+    踩过的坑：
+      · `timeout /t 1` 在 DETACHED_PROCESS（无控制台）下会立刻失败 →
+        等待循环变成忙循环。改用 `ping -n 2 127.0.0.1 >nul` 做延时。
+      · `tasklist | find <进程名>` 不够可靠；改成按 **PID** 判存活。
+      · 路径含空格时 `cmd /c "C:\a b\x.bat"` 可能被拆错；
+        所以脚本用**相对文件名**启动（cwd 已经是 app_dir）。
+      · 万一等不到退出（例如被占用），60 秒后**放弃替换**并把旧版拉起来，
+        绝不留下装了一半的安装。
+    """
     src = os.path.join(stage, "Gallery4ComfyUI")
-    bat = os.path.join(app_dir, "_apply_update.bat")
-    exe = os.path.join(app_dir, "Gallery4ComfyUI.exe")
+    exe_name = "Gallery4ComfyUI.exe"
+    log_name = "_update_run.log"
     L = [
         "@echo off",
+        "setlocal enabledelayedexpansion",
         "chcp 65001 >nul 2>&1",
-        "title Gallery4ComfyUI update",
-        "echo Waiting for app to exit...",
+        "cd /d \"%~dp0\"",
+        "set TRIES=0",
+        'echo [%date% %time%] updater start (pid=%s)>>"%s"' % (pid, log_name),
         ":wait",
-        'tasklist /NH /FI "IMAGENAME eq Gallery4ComfyUI.exe" 2>nul | find /I "Gallery4ComfyUI.exe" >nul',
-        "if not errorlevel 1 (",
-        "  timeout /t 1 /nobreak >nul",
-        "  goto wait",
-        ")",
-        "echo Replacing program files...",
-        # _internal 是程序目录，可以镜像（顺带清掉旧版本残留 dll）
-        'robocopy "%s\\_internal" "%s\\_internal" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, app_dir),
-        # 只点名两个文件 → config.json 永远不会被覆盖
-        'robocopy "%s" "%s" Gallery4ComfyUI.exe app.ico /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, app_dir),
-        # data 只增不删（用户的画师库自定义文件必须留着）
-        'if exist "%s\\data" robocopy "%s\\data" "%s\\data" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, src, app_dir),
-        "echo Starting new version...",
-        'cd /d "%s"' % app_dir,
-        'start "" "%s"' % exe,
+        'tasklist /NH /FI "PID eq %s" 2>nul | findstr /C:"%s" >nul' % (pid, pid),
+        "if errorlevel 1 goto repl",
+        "set /a TRIES+=1",
+        "if %TRIES% geq 90 goto toolong",
+        "ping -n 2 127.0.0.1 >nul 2>&1",
+        "goto wait",
+        ":toolong",
+        'echo [%date% %time%] TIMEOUT waiting for pid %s -> abort, keep old version>>"%s"' % (pid, log_name),
+        'start "" "%s"' % exe_name,
+        "goto end",
+        ":repl",
+        'echo [%date% %time%] app exited, replacing files>>"%s"' % log_name,
+        'robocopy "%s\\_internal" "_internal" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % src,
+        'if errorlevel 8 echo [%date% %time%] WARN robocopy _internal failed (%ERRORLEVEL%)>>"%s"' % log_name,
+        # 只点名两个文件 → config.json 绝不会被更新包里的空模板覆盖
+        'robocopy "%s" "." %s app.ico /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, exe_name),
+        'if errorlevel 8 echo [%date% %time%] WARN robocopy exe failed (%ERRORLEVEL%)>>"%s"' % log_name,
+        # data 只增不删：用户的自定义画师库必须留着
+        'if exist "%s\\data" robocopy "%s\\data" "data" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP' % (src, src),
+        'echo [%date% %time%] starting new version>>"%s"' % log_name,
+        'start "" "%s"' % exe_name,
         'rmdir /s /q "%s" 2>nul' % stage,
+        ":end",
+        'echo [%date% %time%] updater done>>"%s"' % log_name,
         'del "%~f0"',
     ]
+    bat = os.path.join(app_dir, "_apply_update.bat")
     with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
         f.write("\n".join(L) + "\n")
     return bat
@@ -1089,11 +1110,13 @@ async def api_update_restart(request):
             return _json({"ok": False, "error": "更新包还没准备好"})
         app_dir = APP_DIR
         exe = os.path.join(app_dir, "Gallery4ComfyUI.exe")
-        bat = _build_updater_bat(app_dir, _UPDATE_STAGING, _UP.get("version", ""))
+        bat = _build_updater_bat(app_dir, _UPDATE_STAGING,
+                                 _UP.get("version", ""), os.getpid())
         _up_set(stage="applying", percent=100, message="正在重启并替换文件…")
         log("开始应用更新：%s" % bat)
-        # DETACHED_PROCESS：批处理不随本进程一起被杀
-        subprocess.Popen(["cmd", "/c", bat], cwd=app_dir,
+        # 用**相对文件名** + cwd=app_dir 启动：路径含空格也不会被 cmd 拆错。
+        # DETACHED_PROCESS：批处理不随本进程一起被结束。
+        subprocess.Popen(["cmd", "/c", os.path.basename(bat)], cwd=app_dir,
                          creationflags=0x00000008,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, close_fds=True)
